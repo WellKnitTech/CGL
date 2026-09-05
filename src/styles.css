@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0c0d0f;
+  --color-surface: #14161a;
+  --color-surface-2: #1c1f26;
+  --color-fg: #e8e6e1;
+  --color-muted: #8b8a86;
+  --color-subtle: #5c5b58;
+  --color-border: color-mix(in oklab, var(--color-fg) 12%, transparent);
+  --color-accent: #c5ccd4;
+  --color-accent-foreground: #0c0d0f;
+  --color-signal: #c45c4a;
+  --color-signal-foreground: #f6eeea;
+  --color-ok: #7d9a7c;
+  --color-warn: #c4a36a;
+  --color-ring: #c5ccd4;
+
+  --font-sans: "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+}
+
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100%;
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

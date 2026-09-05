@@ -1,0 +1,2177 @@
+#!/usr/bin/env python3
+"""
+Forensic Triage Parser - Velociraptor Hunt Results
+v4.9 - Hardened for interactive and unattended / scheduled-task use.
+      Compatible with Hayabusa v4+ (dfir-timeline + lowercased long options).
+      Individual Hayabusa starts as soon as each collection is extracted and
+      also runs for already-extracted collections when the Hayabusa marker or
+      output CSV is missing. Bulk Hayabusa still waits until all extractions finish.
+      Supports multiple known Kroll_Batch.reb versions (SHA256 allow-list) so both
+      upstream ZimmermanTools and common KAPE-shipped variants can be used.
+
+Dual-use notes:
+- Interactive: prompts for paths, stage options, and optional Windows scheduled task setup.
+- --setup: interactive configure (+ scheduler) only; does not run the pipeline.
+- Non-interactive (--non-interactive / -ni): requires a config file; never prompts; loads
+  stage flags from config/CLI (safe defaults: optional stages off).
+"""
+
+import sys
+import os
+import gc
+import csv
+import json
+import re
+import time
+import shutil
+import logging
+import hashlib
+import traceback
+import subprocess
+import importlib.util
+import multiprocessing
+import tempfile
+import urllib.request
+import urllib.error
+from datetime import datetime
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures.process import BrokenProcessPool
+import argparse
+
+SCRIPT_VERSION = "4.9"
+REQUIRED_PACKAGES = ["tqdm", "orjson", "ijson"]
+
+# Named constants
+STAGE_MARKER_NAME = ".COMPLETE"
+LARGE_FILE_THRESHOLD_MB = 40
+CSV_BUFFER_BYTES = 32 * 1024 * 1024
+SINGLE_OBJECT_MAX_BYTES = 16 * 1024 * 1024
+SLOW_FILE_SECONDS = 180
+POOL_AS_COMPLETED_TIMEOUT = 30
+MAX_TASKS_PER_CHILD = 200
+LOG_STDERR_TRUNCATE = 500
+KROLL_MIN_BYTES = 1000
+KROLL_DOWNLOAD_MIN_BYTES = 5000
+KROLL_BATCH_URL = (
+    "https://raw.githubusercontent.com/EricZimmerman/RECmd/master/BatchExamples/Kroll_Batch.reb"
+)
+# Pinned SHA256 of the *upstream* Kroll_Batch.reb used for downloads (EricZimmerman/RECmd master)
+UPSTREAM_KROLL_BATCH_SHA256 = "e535024e0b48998a8d9b0d2d909618cf83c89c7b6ec7d7d8eb0285dadb93b1d2"
+# Allowed SHA256 digests for any Kroll_Batch.reb on disk (supports multiple known versions)
+# Add additional hashes here when new legitimate variants appear (e.g. KAPE-shipped copies).
+KNOWN_KROLL_BATCH_SHA256 = {
+    "e535024e0b48998a8d9b0d2d909618cf83c89c7b6ec7d7d8eb0285dadb93b1d2",  # upstream / ZimmermanTools
+    "fdc7917e9615f89554e24a877bca083b38e9f609488ddedb30bd00d646af7f15",  # common KAPE Modules/bin variant
+}
+
+# Module-level verbose flag (set from CLI in main)
+VERBOSE = False
+
+# =========================
+# VERSION CHECK
+# =========================
+if sys.version_info < (3, 11):
+    print("\n[!] Error: This script requires Python 3.11 or higher.")
+    sys.exit(1)
+
+# =========================
+# DEPENDENCY CHECK (no auto-pip)
+# =========================
+def missing_dependencies():
+    return [pkg for pkg in REQUIRED_PACKAGES if importlib.util.find_spec(pkg) is None]
+
+_asking_help = any(a in ("-h", "--help") for a in sys.argv[1:])
+_missing_deps = missing_dependencies()
+if _missing_deps and not _asking_help:
+    print(
+        f"[SYSTEM] Missing required packages: {', '.join(_missing_deps)}.\n"
+        "         Install with: pip install -r requirements.txt"
+    )
+    sys.exit(1)
+
+if importlib.util.find_spec("tqdm") is not None:
+    from tqdm import tqdm
+elif _asking_help:
+    tqdm = None  # type: ignore[assignment, misc]
+else:
+    print("[SYSTEM] Missing required package: tqdm")
+    print("         Install with: pip install -r requirements.txt")
+    sys.exit(1)
+
+# =========================
+# FAST JSON HELPERS
+# =========================
+def get_json_helpers():
+    try:
+        import orjson
+        return orjson.loads, orjson.dumps
+    except ImportError:
+        def std_loads(x):
+            if isinstance(x, bytes):
+                x = x.decode("utf-8", errors="replace")
+            return json.loads(x)
+        def std_dumps(x):
+            return json.dumps(x, ensure_ascii=False).encode("utf-8")
+        return std_loads, std_dumps
+
+loads, dumps = get_json_helpers()
+
+def flatten_json_iterative(data, sep="_"):
+    out = {}
+    stack = [(None, data)]
+    while stack:
+        parent_key, current = stack.pop()
+        if isinstance(current, dict):
+            for k, v in current.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key is not None else str(k)
+                stack.append((new_key, v))
+        elif isinstance(current, list):
+            for i, v in enumerate(current):
+                new_key = f"{parent_key}{sep}{i}" if parent_key is not None else str(i)
+                stack.append((new_key, v))
+        else:
+            key = parent_key if parent_key is not None else ""
+            out[key] = "" if current is None else current
+    return out
+
+def first_non_whitespace_byte(file_path):
+    whitespace = {9, 10, 13, 32}
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(4096)
+            if not chunk:
+                return None
+            for b in chunk:
+                if b not in whitespace:
+                    return b
+
+# =========================
+# HELPERS
+# =========================
+def get_input_with_default(prompt: str, default: str) -> str:
+    user_input = input(f"{prompt} [{default}]: ").strip()
+    return user_input if user_input else default
+
+def count_results_json(folder: Path) -> int:
+    """Count JSON files under results/ directories (same discovery as Stage 2)."""
+    count = 0
+    for results_dir in folder.rglob("results"):
+        if not results_dir.is_dir():
+            continue
+        for _ in results_dir.rglob("*.json"):
+            count += 1
+    return count
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def verify_kroll_sha256(path: Path) -> bool:
+    """Return True if the file's SHA256 is in the set of known-good Kroll_Batch.reb versions."""
+    if not path.is_file():
+        return False
+    digest = file_sha256(path).lower()
+    allowed = {h.lower() for h in KNOWN_KROLL_BATCH_SHA256}
+    if digest not in allowed:
+        logging.error(
+            f"Kroll_Batch.reb SHA256 mismatch for {path}: got {digest}, "
+            f"expected one of {sorted(allowed)}"
+        )
+        return False
+    return True
+
+def read_stage_marker(marker_path: Path) -> dict | None:
+    """Return marker JSON dict, {} for legacy empty/non-JSON file, or None if missing."""
+    if not marker_path.is_file():
+        return None
+    try:
+        text = marker_path.read_text(encoding="utf-8").strip()
+        if not text:
+            return {}  # legacy empty touch marker
+        return json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return {}  # legacy non-JSON
+
+def has_stage_complete(marker_path: Path, expected: dict | None = None) -> bool:
+    """
+    If expected is None: any existing marker (including legacy) counts as complete.
+    If expected is provided: require JSON marker whose listed keys match expected values.
+    Legacy empty/non-JSON markers are invalid when expected is provided.
+    """
+    data = read_stage_marker(marker_path)
+    if data is None:
+        return False
+    if expected is None:
+        return True
+    if not data:
+        return False  # legacy — force refresh when validating metadata
+    for key, value in expected.items():
+        if value is None:
+            continue
+        if data.get(key) != value:
+            return False
+    return True
+
+def mark_stage_complete(marker_path: Path, metadata: dict | None = None) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "completed_at": datetime.now().isoformat(),
+        **(metadata or {}),
+    }
+    marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+def clear_stage_complete(marker_path: Path) -> None:
+    try:
+        if marker_path.is_file():
+            marker_path.unlink()
+    except OSError as e:
+        logging.warning(f"Could not clear stage marker {marker_path}: {e}")
+
+def record_error(run_errors: list, stage: str, collection: str | None, message: str) -> None:
+    run_errors.append({
+        "stage": stage,
+        "collection": collection,
+        "message": message,
+        "at": datetime.now().isoformat(),
+    })
+    logging.error(f"[{stage}] {collection or '-'}: {message}")
+
+def ensure_collection_status(collection_status: dict, name: str) -> dict:
+    if name not in collection_status:
+        collection_status[name] = {
+            "extract": None,
+            "csv": None,
+            "recmd": None,
+            "hayabusa": None,
+        }
+    return collection_status[name]
+
+def resolve_bool_option(cli_flag: bool, config: dict, key: str, default: bool = False) -> bool:
+    """CLI store_true wins when set; otherwise config; otherwise default."""
+    if cli_flag:
+        return True
+    if key in config:
+        return bool(config[key])
+    return default
+
+def inventory_source_item(item: Path) -> dict:
+    """Chain-of-custody record for a source zip or folder collection."""
+    entry = {
+        "path": str(item),
+        "name": item.name,
+        "type": "zip" if item.suffix.lower() == ".zip" else "folder",
+        "size_bytes": None,
+        "mtime": None,
+        "sha256": None,
+    }
+    try:
+        st = item.stat()
+        entry["size_bytes"] = st.st_size
+        entry["mtime"] = datetime.fromtimestamp(st.st_mtime).isoformat()
+        if item.is_file() and item.suffix.lower() == ".zip":
+            entry["sha256"] = file_sha256(item)
+    except OSError as e:
+        entry["error"] = str(e)
+    return entry
+
+def find_latest_hayabusa(hayabusa_dir: Path):
+    hayabusa_dir = Path(hayabusa_dir)
+    if not hayabusa_dir.exists() or not hayabusa_dir.is_dir():
+        return None
+    candidates = list(hayabusa_dir.glob("hayabusa*.exe"))
+    if not candidates:
+        plain = hayabusa_dir / "hayabusa.exe"
+        if plain.exists():
+            return plain
+        return None
+
+    def parse_version(p: Path):
+        name = p.stem.lower()
+        match = re.search(r'(\d+)\.(\d+)\.(\d+)', name)
+        if match:
+            return tuple(int(x) for x in match.groups())
+        return (0, 0, 0)
+
+    candidates.sort(key=lambda p: (parse_version(p), p.stat().st_mtime), reverse=True)
+    return candidates[0]
+
+def find_7zip() -> Path | None:
+    candidates = [
+        Path(r"C:\Program Files\7-Zip\7z.exe"),
+        Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+def find_recmd() -> Path | None:
+    candidates = [
+        Path(r"C:\tools\ZimmermanTools\net9\RECmd\RECmd.exe"),
+        Path(r"C:\Tools\ZimmermanTools\net9\RECmd\RECmd.exe"),
+        Path(r"C:\Program Files\ZimmermanTools\RECmd\RECmd.exe"),
+        Path(r"C:\Tools\EZ Tools\RECmd\RECmd.exe"),
+        Path(r"C:\tools\EZ Tools\RECmd\RECmd.exe"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+def find_hayabusa_dir() -> Path | None:
+    candidates = [
+        Path(r"C:\tools\hayabusa"),
+        Path(r"C:\Tools\hayabusa"),
+        Path(r"C:\Program Files\hayabusa"),
+        Path(r"C:\Program Files (x86)\hayabusa"),
+    ]
+    for d in candidates:
+        if d.exists() and d.is_dir():
+            if list(d.glob("hayabusa*.exe")):
+                return d
+    return None
+
+def get_hayabusa_version(exe_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            [str(exe_path), "--version"],
+            capture_output=True, text=True, timeout=8
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout.strip().splitlines()[0]
+    except Exception:
+        pass
+    return "unknown"
+
+# =========================
+# KROLL BATCH - verified download / offline prefer
+# =========================
+def ensure_kroll_batch(batch_path: Path, recmd_dir: Path | None = None, non_interactive: bool = False) -> Path:
+    """Return a verified Kroll batch path, or the original path if unavailable (basic RECmd mode)."""
+    if batch_path.exists() and batch_path.stat().st_size > KROLL_MIN_BYTES:
+        if verify_kroll_sha256(batch_path):
+            return batch_path
+        print(f"[ERROR] Existing Kroll_Batch.reb failed SHA256 verification: {batch_path}")
+        print("        RECmd will run in basic mode (batch not used).")
+        return batch_path  # caller checks exists+hash before --bn
+
+    print(f"\n[INFO] Kroll_Batch.reb not found or unusable at: {batch_path}")
+
+    if recmd_dir and recmd_dir.exists():
+        target_dir = recmd_dir / "BatchExamples"
+    else:
+        target_dir = batch_path.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / "Kroll_Batch.reb"
+
+    if target_file.exists() and target_file.stat().st_size > KROLL_MIN_BYTES:
+        if verify_kroll_sha256(target_file):
+            return target_file
+
+    if non_interactive:
+        print("[NON-INTERACTIVE] Kroll_Batch.reb missing — downloading from GitHub...")
+        choice = "y"
+    else:
+        choice = input("Download Kroll_Batch.reb automatically from GitHub? (y/n): ").strip().lower()
+
+    if choice != "y":
+        print("[INFO] Skipping download. RECmd will run in basic mode.")
+        return batch_path
+
+    print(f"[DOWNLOAD] Fetching {KROLL_BATCH_URL} ...")
+
+    try:
+        req = urllib.request.Request(
+            KROLL_BATCH_URL,
+            headers={"User-Agent": f"ForensicTriageParser/{SCRIPT_VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            content = response.read()
+
+        if len(content) < KROLL_DOWNLOAD_MIN_BYTES:
+            print("[ERROR] Downloaded file seems too small. Aborting.")
+            return batch_path
+
+        digest = hashlib.sha256(content).hexdigest()
+        if digest.lower() != UPSTREAM_KROLL_BATCH_SHA256.lower():
+            print(f"[ERROR] Downloaded Kroll_Batch.reb SHA256 mismatch (got {digest}). Refusing to use it.")
+            logging.error(f"Kroll download SHA256 mismatch: {digest}")
+            return batch_path
+
+        with open(target_file, "wb") as f:
+            f.write(content)
+
+        print(f"[SUCCESS] Downloaded Kroll_Batch.reb → {target_file} ({len(content)} bytes)")
+        logging.info(f"Downloaded verified Kroll_Batch.reb to {target_file}")
+        return target_file
+
+    except Exception as e:
+        print(f"[ERROR] Download failed: {e}")
+        logging.error(f"Failed to download Kroll_Batch.reb: {e}")
+        print("        RECmd will continue in basic mode.")
+        return batch_path
+
+# =========================
+# WINDOWS SCHEDULED TASK (PowerShell Register-ScheduledTask)
+# =========================
+DEFAULT_SCHEDULED_TASK_MINUTES = 30
+
+def _ps_quote(value: str) -> str:
+    """Single-quote a string for PowerShell literals."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+def _run_powershell_script(script_text: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Write a temp .ps1 and execute it with powershell.exe."""
+    ps1_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".ps1",
+            prefix="ftp_sched_",
+            delete=False,
+            encoding="utf-8",
+        ) as tf:
+            tf.write(script_text)
+            ps1_path = tf.name
+        return subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                ps1_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    finally:
+        if ps1_path:
+            try:
+                Path(ps1_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+def scheduled_task_minutes_from_config(config: dict | None) -> int:
+    raw = (config or {}).get("scheduled_task_minutes", DEFAULT_SCHEDULED_TASK_MINUTES)
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        minutes = DEFAULT_SCHEDULED_TASK_MINUTES
+    return max(1, minutes)
+
+def scheduled_task_exists(task_name: str) -> bool:
+    if os.name != "nt":
+        return False
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$t = Get-ScheduledTask -TaskName {_ps_quote(task_name)} -ErrorAction SilentlyContinue
+if ($null -ne $t) {{ exit 0 }} else {{ exit 1 }}
+"""
+    try:
+        result = _run_powershell_script(script, timeout=30)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def create_or_update_scheduled_task(
+    task_name: str,
+    script_path: Path,
+    config_path: Path,
+    frequency_minutes: int = DEFAULT_SCHEDULED_TASK_MINUTES,
+    python_exe: Path | None = None,
+    run_as_system: bool = False,
+    working_dir: Path | None = None,
+) -> bool:
+    if os.name != "nt":
+        print("[SCHED] Scheduled tasks are only supported on Windows.")
+        return False
+
+    frequency_minutes = max(1, int(frequency_minutes))
+
+    if python_exe is None or not python_exe.exists():
+        for candidate in [
+            Path(sys.executable).with_name("python.exe"),
+            Path(sys.executable),
+        ]:
+            if candidate.exists():
+                python_exe = candidate
+                break
+        if python_exe is None:
+            python_exe = Path(sys.executable)
+
+    if working_dir is None:
+        working_dir = script_path.parent.resolve()
+
+    script_path = Path(script_path).resolve()
+    config_path = Path(config_path).resolve()
+    working_dir = Path(working_dir).resolve()
+    python_exe = Path(python_exe).resolve()
+
+    # Execute = python; Argument = script + flags (Task Scheduler split action model)
+    argument = (
+        f'"{script_path}" --non-interactive --config "{config_path}"'
+    )
+    display_cmd = f'"{python_exe}" {argument}'
+
+    print(f"[SCHED] Preparing to register task '{task_name}' via PowerShell")
+    print(f"[SCHED] Command: {display_cmd}")
+    print(f"[SCHED] Working directory: {working_dir}")
+    print(f"[SCHED] Interval: every {frequency_minutes} minutes (IgnoreNew)")
+
+    if run_as_system:
+        principal_block = (
+            "$principal = New-ScheduledTaskPrincipal "
+            "-UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest"
+        )
+    else:
+        principal_block = (
+            "$principal = New-ScheduledTaskPrincipal "
+            "-UserId $env:USERNAME -LogonType Interactive -RunLevel Highest"
+        )
+
+    # Once + finite RepetitionDuration is the valid parameter set.
+    # Do NOT pass Repetition* with -Daily (AmbiguousParameterSet).
+    # Do NOT use [TimeSpan]::MaxValue (invalid task XML duration).
+    ps_script = f"""
+$ErrorActionPreference = 'Stop'
+$action = New-ScheduledTaskAction `
+  -Execute {_ps_quote(str(python_exe))} `
+  -Argument {_ps_quote(argument)} `
+  -WorkingDirectory {_ps_quote(str(working_dir))}
+
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+  -RepetitionInterval (New-TimeSpan -Minutes {frequency_minutes}) `
+  -RepetitionDuration (New-TimeSpan -Days 3650)
+
+$settings = New-ScheduledTaskSettingsSet `
+  -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries `
+  -StartWhenAvailable `
+  -MultipleInstances IgnoreNew `
+  -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+{principal_block}
+
+Register-ScheduledTask `
+  -TaskName {_ps_quote(task_name)} `
+  -Action $action `
+  -Trigger $trigger `
+  -Settings $settings `
+  -Principal $principal `
+  -Force | Out-Null
+
+$check = Get-ScheduledTask -TaskName {_ps_quote(task_name)} -ErrorAction Stop
+Write-Output ("Registered: " + $check.TaskName)
+"""
+
+    try:
+        result = _run_powershell_script(ps_script, timeout=60)
+        combined = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if result.returncode == 0 and scheduled_task_exists(task_name):
+            run_context = "SYSTEM (highest privileges)" if run_as_system else "Current user"
+            print(f"[SCHED] Successfully created/updated scheduled task: '{task_name}'")
+            print(f"        Frequency        : Every {frequency_minutes} minutes (~10 years)")
+            print(f"        Runs as          : {run_context}")
+            print(f"        Working directory: {working_dir}")
+            print(f"        Multiple instances: IgnoreNew (skip if already running)")
+            print(f"        Command          : {display_cmd}")
+            logging.info(
+                f"Created/updated scheduled task '{task_name}' "
+                f"(run_as_system={run_as_system}, minutes={frequency_minutes})"
+            )
+            return True
+
+        print("[SCHED][ERROR] Failed to create/update scheduled task via PowerShell.")
+        if result.stdout and result.stdout.strip():
+            print(f"        STDOUT: {result.stdout.strip()}")
+        if result.stderr and result.stderr.strip():
+            print(f"        STDERR: {result.stderr.strip()}")
+        if run_as_system and (
+            "access is denied" in combined.lower()
+            or "access denied" in combined.lower()
+            or "unauthorized" in combined.lower()
+        ):
+            print("        Hint: Run this script as Administrator to create a SYSTEM task.")
+        logging.error(f"Failed to create scheduled task: {combined}")
+        return False
+    except Exception as e:
+        print(f"[SCHED][ERROR] Exception: {e}")
+        logging.error(f"Exception creating scheduled task: {e}")
+        return False
+
+def delete_scheduled_task(task_name: str) -> bool:
+    if os.name != "nt":
+        return False
+    if not scheduled_task_exists(task_name):
+        return True
+    script = f"""
+$ErrorActionPreference = 'Stop'
+Unregister-ScheduledTask -TaskName {_ps_quote(task_name)} -Confirm:$false
+"""
+    try:
+        result = _run_powershell_script(script, timeout=30)
+        if result.returncode == 0:
+            print(f"[SCHED] Removed scheduled task '{task_name}'")
+            logging.info(f"Deleted scheduled task '{task_name}'")
+            return True
+        print(f"[SCHED][ERROR] Failed to remove task '{task_name}'")
+        if result.stderr and result.stderr.strip():
+            print(f"        STDERR: {result.stderr.strip()}")
+        return False
+    except Exception as e:
+        logging.error(f"Exception deleting scheduled task: {e}")
+        return False
+
+# =========================
+# CONFIG / LOGGING
+# =========================
+def load_config(config_path):
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[CONFIG] Failed to load config: {e}. Starting fresh.")
+    return {}
+
+def save_config(config_path, config_dict):
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config_dict, f, indent=4)
+    except Exception as e:
+        logging.warning(f"Failed to save config: {e}")
+
+def setup_logging(log_root):
+    log_root = Path(log_root)
+    log_root.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_root / f"Forensic_Triage_Run_{timestamp}.log"
+    last_log_file = log_root / "last_run.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.FileHandler(last_log_file, encoding="utf-8", mode='w'),
+            logging.StreamHandler(sys.stdout)
+        ],
+        force=True,
+    )
+    logging.info(f"=== Forensic Triage Parser Started (v{SCRIPT_VERSION}) ===")
+    logging.info(f"Detailed log: {log_file}")
+    logging.info(f"Latest run mirrored to: {last_log_file}")
+    return log_file
+
+def decode_subprocess_output(blob):
+    if blob is None:
+        return ""
+    if isinstance(blob, str):
+        return blob
+    return blob.decode("utf-8", errors="replace")
+
+def run_command(cmd, description):
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=False)
+        return True, decode_subprocess_output(result.stdout), decode_subprocess_output(result.stderr)
+    except subprocess.CalledProcessError as e:
+        stdout = decode_subprocess_output(e.stdout)
+        stderr = decode_subprocess_output(e.stderr)
+        logging.error(f"{description} failed with exit code {e.returncode}")
+        if VERBOSE:
+            if stdout.strip():
+                logging.error(f"{description} STDOUT: {stdout.strip()}")
+            if stderr.strip():
+                logging.error(f"{description} STDERR: {stderr.strip()}")
+        else:
+            snippet = (stderr or stdout).strip().replace("\n", " ")
+            if snippet:
+                logging.error(f"{description} STDERR (truncated): {snippet[:LOG_STDERR_TRUNCATE]}")
+        return False, stdout, stderr
+    except Exception as e:
+        logging.error(f"{description} failed: {e}")
+        return False, "", str(e)
+
+def run_7zip_extract(sz_exe, zip_path, out_path):
+    cmd = [str(sz_exe), "x", str(zip_path), f"-o{str(out_path)}", "-y"]
+    ok, _, _ = run_command(cmd, f"7-Zip extract [{zip_path.name}]")
+    return ok
+
+def run_hayabusa_cmd(exe_path, target_path, output_file):
+    # Hayabusa v4.0.0+ (Jul 2026): csv-timeline/json-timeline merged into dfir-timeline.
+    # Long option names standardized to lowercase (--EID-filter → --eid-filter, --UTC → --utc).
+    # Default output type is CSV; -t/--output-type can select json/jsonl if needed later.
+    cmd = [
+        str(exe_path),
+        "dfir-timeline",
+        "-d",
+        str(target_path),
+        "--proven-rules",
+        "--eid-filter",
+        "--utc",
+        "--enable-unsupported-rules",
+        "--visualize-timeline",
+        "--no-wizard",
+        "--sort",
+        "-o",
+        str(output_file),
+    ]
+    ok, _, _ = run_command(cmd, f"Hayabusa [{Path(target_path).name}]")
+    return ok
+
+
+def collection_has_evtx(folder: Path) -> bool:
+    """Quick check whether an extracted collection contains any .evtx files."""
+    try:
+        for _ in folder.rglob("*.evtx"):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def process_individual_hayabusa(
+    folder: Path,
+    hayabusa_exe: Path,
+    hayabusa_out: Path,
+    haya_tool_version: str,
+    haya_expected: dict,
+    force_reprocess: bool,
+) -> dict:
+    """
+    Run individual Hayabusa for one collection.
+    Returns a result dict so the main thread can update shared status safely.
+
+    Runs when:
+      - force_reprocess is True, OR
+      - the Hayabusa completion marker is missing / does not match the current
+        tool version, OR
+      - the expected output CSV is missing (defensive for already-extracted
+        collections that never had Hayabusa run).
+    """
+    collection_name = folder.name
+    result = {
+        "collection": collection_name,
+        "status": "failed",
+        "skipped": False,
+        "message": "",
+    }
+
+    if not folder.exists():
+        result["message"] = "Extract folder missing"
+        return result
+
+    out_csv = hayabusa_out / f"{collection_name}.csv"
+    haya_marker = hayabusa_out / f"{collection_name}.COMPLETE"
+
+    marker_ok = has_stage_complete(haya_marker, haya_expected)
+    csv_exists = out_csv.is_file() and out_csv.stat().st_size > 0
+
+    if force_reprocess:
+        clear_stage_complete(haya_marker)
+        if out_csv.exists():
+            try:
+                out_csv.unlink()
+            except OSError as e:
+                logging.warning(f"Could not remove prior Hayabusa CSV {out_csv}: {e}")
+        marker_ok = False
+        csv_exists = False
+    elif marker_ok and csv_exists:
+        # Both marker and output present → truly complete
+        result["status"] = "skipped"
+        result["skipped"] = True
+        result["message"] = "already complete"
+        return result
+    elif marker_ok and not csv_exists:
+        # Marker exists but output is gone → treat as incomplete and re-run
+        logging.warning(
+            f"Hayabusa marker present for {collection_name} but output CSV missing — re-running"
+        )
+        clear_stage_complete(haya_marker)
+
+    if not collection_has_evtx(folder):
+        result["status"] = "skipped"
+        result["skipped"] = True
+        result["message"] = "no .evtx files found"
+        logging.info(f"SKIPPED Hayabusa for {collection_name} - no .evtx files")
+        return result
+
+    reason = "force_reprocess" if force_reprocess else (
+        "missing marker/output" if not marker_ok or not csv_exists else "unknown"
+    )
+    logging.info(f"Starting individual Hayabusa for {collection_name} ({reason})")
+    if run_hayabusa_cmd(hayabusa_exe, folder, out_csv):
+        mark_stage_complete(haya_marker, {
+            "stage": "hayabusa",
+            "tool_version": haya_tool_version,
+        })
+        result["status"] = "success"
+        result["message"] = "completed"
+    else:
+        result["status"] = "failed"
+        result["message"] = "Hayabusa failed"
+
+    return result
+
+
+def run_recmd_cmd(exe_path, target_path, output_dir, batch_file: Path | None = None):
+    cmd = [
+        str(exe_path),
+        "-d",
+        str(target_path),
+        "--csv",
+        str(output_dir),
+        "--nl",
+        "false",
+    ]
+    used_batch = False
+    if batch_file and batch_file.exists() and verify_kroll_sha256(batch_file):
+        cmd.insert(5, "--bn")
+        cmd.insert(6, str(batch_file))
+        used_batch = True
+    else:
+        if batch_file and batch_file.exists():
+            logging.warning(
+                f"Kroll_Batch.reb at {batch_file} failed verification — running RECmd in basic mode."
+            )
+        elif batch_file:
+            logging.warning(f"Kroll_Batch.reb not found at {batch_file} — running RECmd in basic mode.")
+    ok, _, _ = run_command(cmd, f"RECmd [{Path(target_path).name}]")
+    return ok, used_batch
+
+# =========================
+# DISCOVERY / SELECTION
+# =========================
+def get_recursive_items(root_path, max_depth=4):
+    found_items = []
+    root_path = Path(root_path)
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        current_path = Path(dirpath)
+        depth = len(current_path.relative_to(root_path).parts)
+        if depth >= max_depth:
+            dirnames[:] = []
+        if current_path != root_path and "collection" in current_path.name.lower():
+            found_items.append(current_path)
+        for filename in filenames:
+            if filename.lower().endswith(".zip") and "collection" in filename.lower():
+                found_items.append(current_path / filename)
+    return sorted(set(found_items))
+
+def select_items(source_root, non_interactive: bool = False):
+    items = get_recursive_items(source_root)
+    if not items:
+        print("[!] No collections found in the source folder yet.")
+        print("    You can still complete setup and create the scheduled task.")
+        logging.warning("No collections found during setup. Continuing to allow scheduled task configuration.")
+        return []
+
+    if non_interactive:
+        print(f"[NON-INTERACTIVE] Automatically processing ALL {len(items)} collections found.")
+        logging.info(f"Non-interactive mode: processing all {len(items)} collections")
+        return items
+
+    print("\n--- COLLECTIONS FOUND ---")
+    for idx, item in enumerate(items, 1):
+        print(f"[{idx}] {item.relative_to(source_root)}")
+    selection = input("\nSelect Numbers (e.g. 1,3), Range (1-5), or 'all': ").strip().lower()
+    if selection == "all":
+        return items
+    selected = []
+    try:
+        if "-" in selection:
+            start, end = map(int, selection.split("-"))
+            selected = items[start - 1 : end]
+        else:
+            for token in selection.split(","):
+                idx = int(token.strip()) - 1
+                if 0 <= idx < len(items):
+                    selected.append(items[idx])
+    except Exception:
+        print("[!] Invalid selection - processing all items.")
+        return items
+    return selected
+
+# =========================
+# JSON ITERATORS
+# =========================
+def iter_ndjson(json_path, loads_func):
+    with open(json_path, "rb") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield loads_func(line)
+            except Exception as e:
+                raise ValueError(f"Failed to parse NDJSON line {line_num}: {e}") from e
+
+def iter_json_array(json_path):
+    import ijson
+    with open(json_path, "rb") as f:
+        for item in ijson.items(f, "item"):
+            yield item
+
+# =========================
+# OPTIMIZED CSV WRITERS
+# =========================
+def write_single_object_csv(obj, target_csv_path):
+    flat = flatten_json_iterative(obj)
+    columns = sorted(flat.keys())
+    with open(target_csv_path, "w", newline="", encoding="utf-8", buffering=CSV_BUFFER_BYTES) as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerow(flat)
+    return 1
+
+def write_csv_via_flattened_spool(obj_iter_factory, target_csv_path, temp_dir=None):
+    all_columns = set()
+    row_count = 0
+    temp_parent = Path(temp_dir) if temp_dir else target_csv_path.parent
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".jsonl", prefix=f"{target_csv_path.stem}_", delete=False, dir=str(temp_parent)) as tmp:
+        spool_path = Path(tmp.name)
+        try:
+            for obj in obj_iter_factory():
+                flat = flatten_json_iterative(obj)
+                all_columns.update(flat.keys())
+                tmp.write(dumps(flat) + b"\n")
+                row_count += 1
+        except Exception:
+            spool_path.unlink(missing_ok=True)
+            raise
+    if row_count == 0:
+        with open(target_csv_path, "w", newline="", encoding="utf-8") as csvfile:
+            csvfile.write("Status\nNo valid JSON objects parsed\n")
+        spool_path.unlink(missing_ok=True)
+        return 0
+    sorted_cols = sorted(all_columns)
+    try:
+        with open(target_csv_path, "w", newline="", encoding="utf-8", buffering=CSV_BUFFER_BYTES) as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(sorted_cols)
+            with open(spool_path, "rb") as sf:
+                for line in sf:
+                    if line.strip():
+                        row = loads(line)
+                        writer.writerow([row.get(col, "") for col in sorted_cols])
+    finally:
+        spool_path.unlink(missing_ok=True)
+    return row_count
+
+def write_large_ndjson_direct(json_path, target_csv_path, loads_func):
+    all_columns = set()
+    row_count = 0
+    for obj in iter_ndjson(json_path, loads_func):
+        flat = flatten_json_iterative(obj)
+        all_columns.update(flat.keys())
+        row_count += 1
+    if row_count == 0:
+        with open(target_csv_path, "w", newline="", encoding="utf-8") as csvfile:
+            csvfile.write("Status\nNo valid JSON objects parsed\n")
+        return 0
+    sorted_cols = sorted(all_columns)
+    with open(target_csv_path, "w", newline="", encoding="utf-8", buffering=CSV_BUFFER_BYTES) as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(sorted_cols)
+        for obj in iter_ndjson(json_path, loads_func):
+            flat = flatten_json_iterative(obj)
+            writer.writerow([flat.get(col, "") for col in sorted_cols])
+    return row_count
+
+# =========================
+# FILE CONVERSION
+# =========================
+def convert_single_file(json_info, results_root, output_root, collection_name, temp_spool_root=None):
+    start = time.perf_counter()
+    json_path = Path(json_info)
+    results_root = Path(results_root)
+    output_root = Path(output_root)
+    temp_spool_root = Path(temp_spool_root) if temp_spool_root else None
+    file_size_mb = round(json_path.stat().st_size / (1024 * 1024), 1)
+    try:
+        relative_to_results = json_path.relative_to(results_root)
+        is_empty = json_path.stat().st_size == 0
+        file_prefix = "EMPTYFILE-" if is_empty else ""
+        target_csv_path = output_root / collection_name / relative_to_results.parent / f"{file_prefix}{json_path.stem}.csv"
+        if target_csv_path.exists() and target_csv_path.stat().st_mtime > json_path.stat().st_mtime:
+            return {"status": "skipped", "file": str(json_path), "detail": "Output newer than input", "elapsed": time.perf_counter() - start}
+        target_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        if is_empty or first_non_whitespace_byte(json_path) is None:
+            with open(target_csv_path, "w", newline="", encoding="utf-8") as csvfile:
+                csvfile.write("Status\nFile empty or whitespace only\n")
+            return {"status": "empty", "file": str(json_path), "detail": "empty", "elapsed": time.perf_counter() - start}
+        written = 0
+        mode = "unknown"
+        first_byte = first_non_whitespace_byte(json_path)
+        if first_byte == ord("["):
+            written = write_csv_via_flattened_spool(lambda: iter_json_array(json_path), target_csv_path, temp_dir=temp_spool_root)
+            mode = "JSON array"
+        elif first_byte == ord("{") and json_path.stat().st_size <= SINGLE_OBJECT_MAX_BYTES:
+            try:
+                with open(json_path, "rb") as f:
+                    obj = loads(f.read())
+                written = write_single_object_csv(obj, target_csv_path)
+                mode = "single JSON object"
+            except Exception:
+                written = write_csv_via_flattened_spool(lambda: iter_ndjson(json_path, loads), target_csv_path, temp_dir=temp_spool_root)
+                mode = "NDJSON fallback"
+        else:
+            if file_size_mb >= LARGE_FILE_THRESHOLD_MB:
+                written = write_large_ndjson_direct(json_path, target_csv_path, loads)
+                mode = "LARGE NDJSON (two-pass direct)"
+            else:
+                written = write_csv_via_flattened_spool(lambda: iter_ndjson(json_path, loads), target_csv_path, temp_dir=temp_spool_root)
+                mode = "NDJSON"
+        elapsed = time.perf_counter() - start
+        return {
+            "status": "success",
+            "file": str(json_path),
+            "detail": f"{written} rows written ({mode}) [{file_size_mb} MB]",
+            "elapsed": elapsed,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "file": str(json_path),
+            "detail": f"{type(e).__name__}: {e}",
+            "elapsed": time.perf_counter() - start,
+            "traceback": traceback.format_exc(),
+        }
+    finally:
+        gc.collect()
+
+# =========================
+# TASK PROCESSING
+# =========================
+def process_tasks_serial(tasks, stats, temp_spool_root=None):
+    logging.warning("Falling back to serial JSON conversion.")
+    for task in tqdm(tasks, desc="JSON → CSV (serial fallback)", unit="file"):
+        res = convert_single_file(*task, str(temp_spool_root) if temp_spool_root else None)
+        status = res.get("status", "error")
+        stats[status] = stats.get(status, 0) + 1
+        elapsed = res.get("elapsed", 0.0)
+        if elapsed >= SLOW_FILE_SECONDS:
+            logging.warning(f"[SERIAL] SLOW FILE: {res.get('file')} | {elapsed:.2f}s | {res.get('detail')}")
+
+def process_tasks_parallel(tasks, stats, num_workers, temp_spool_root=None):
+    if not tasks:
+        return
+    ctx = multiprocessing.get_context("spawn")
+    logging.info(f"Starting parallel JSON conversion with {num_workers} workers (leaving 2 cores free)")
+    max_in_flight = max(num_workers * 3, 6)
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx, max_tasks_per_child=MAX_TASKS_PER_CHILD) as executor:
+            task_iter = iter(tasks)
+            futures = {}
+            def submit_next():
+                try:
+                    task = next(task_iter)
+                    fut = executor.submit(convert_single_file, *task, str(temp_spool_root) if temp_spool_root else None)
+                    futures[fut] = task[0]
+                    return True
+                except StopIteration:
+                    return False
+            for _ in range(min(max_in_flight, len(tasks))):
+                if not submit_next():
+                    break
+            with tqdm(total=len(tasks), desc="JSON → CSV", unit="file") as pbar:
+                while futures:
+                    try:
+                        completed = next(as_completed(list(futures.keys()), timeout=POOL_AS_COMPLETED_TIMEOUT))
+                        done_now = [completed]
+                    except TimeoutError:
+                        continue
+                    for future in done_now:
+                        src = futures.pop(future)
+                        try:
+                            res = future.result()
+                            status = res.get("status", "error")
+                            stats[status] = stats.get(status, 0) + 1
+                            elapsed = res.get("elapsed", 0.0)
+                            if elapsed >= SLOW_FILE_SECONDS:
+                                logging.warning(f"SLOW FILE: {res.get('file')} | {elapsed:.2f}s | {res.get('detail')}")
+                            if status == "error":
+                                logging.error(f"Failed: {res.get('file')} | {res.get('detail')}")
+                                if res.get("traceback") and VERBOSE:
+                                    logging.error(res.get("traceback"))
+                        except Exception as e:
+                            stats["error"] = stats.get("error", 0) + 1
+                            logging.error(f"Future failure for {src}: {e}")
+                        finally:
+                            pbar.update(1)
+                        while len(futures) < max_in_flight:
+                            if not submit_next():
+                                break
+    except BrokenProcessPool:
+        logging.warning("Process pool broke → serial fallback")
+        process_tasks_serial(tasks, stats, temp_spool_root=temp_spool_root)
+
+# =========================
+# MAIN (with top-level try/except for robustness)
+# =========================
+def get_recmd_version(exe_path: Path) -> str:
+    return exe_path.name if exe_path else "unknown"
+
+
+def load_paths_from_config(config: dict) -> dict:
+    source_root = Path(config.get("source_root", r"E:\data_ingest")).resolve()
+    unzip_root = Path(config.get("unzip_root", r"E:\Results\Extracted")).resolve()
+    output_root = Path(config.get("output_root", r"E:\Results\CSVOutput")).resolve()
+    log_root = Path(config.get("log_root", str(output_root / "logs"))).resolve()
+
+    if "hayabusa_dir" in config:
+        hayabusa_dir = Path(config["hayabusa_dir"]).resolve()
+    elif "hayabusa_exe" in config:
+        hayabusa_dir = Path(config["hayabusa_exe"]).parent.resolve()
+    else:
+        hayabusa_dir = find_hayabusa_dir() or Path(r"C:\tools\hayabusa").resolve()
+
+    hayabusa_exe = find_latest_hayabusa(hayabusa_dir)
+    if hayabusa_exe is None:
+        print(f"[WARNING] No Hayabusa executable found in {hayabusa_dir}.")
+        hayabusa_exe = Path(config.get("hayabusa_exe", hayabusa_dir / "hayabusa.exe"))
+
+    hayabusa_out = Path(config["hayabusa_out"]).resolve() if config.get("hayabusa_out") else None
+
+    sevenzip_exe = Path(config.get("sevenzip_exe", "")).resolve() if config.get("sevenzip_exe") else None
+    if not sevenzip_exe or not sevenzip_exe.exists():
+        sevenzip_exe = find_7zip() or Path(r"C:\Program Files\7-Zip\7z.exe").resolve()
+
+    recmd_exe = Path(config.get("recmd_exe", "")).resolve() if config.get("recmd_exe") else None
+    if not recmd_exe or not recmd_exe.exists():
+        recmd_exe = find_recmd() or Path(r"C:\tools\ZimmermanTools\net9\RECmd\RECmd.exe").resolve()
+
+    kroll_batch = Path(
+        config.get("kroll_batch_reb", r"C:\Tools\KAPE\Modules\bin\RECmd\BatchExamples\Kroll_Batch.reb")
+    ).resolve()
+
+    return {
+        "source_root": source_root,
+        "unzip_root": unzip_root,
+        "output_root": output_root,
+        "log_root": log_root,
+        "hayabusa_dir": hayabusa_dir,
+        "hayabusa_exe": hayabusa_exe,
+        "hayabusa_out": hayabusa_out,
+        "sevenzip_exe": sevenzip_exe,
+        "recmd_exe": recmd_exe,
+        "kroll_batch": kroll_batch,
+    }
+
+
+def prompt_paths_interactive() -> dict:
+    print("\n[SETUP] First-time or fresh setup. Press [Enter] to accept the shown default.")
+
+    source_root = Path(get_input_with_default(
+        "[INPUT] Enter the path to the zipped Velociraptor offline collections",
+        r"E:\data_ingest"
+    )).resolve()
+
+    unzip_root = Path(get_input_with_default(
+        "[INPUT] Enter the directory for unzipped collections",
+        r"E:\Results\Extracted"
+    )).resolve()
+
+    output_root = Path(get_input_with_default(
+        "[INPUT] Enter the directory for CSV output",
+        r"E:\Results\CSVOutput"
+    )).resolve()
+
+    default_log_str = str(output_root / "logs")
+    log_input = get_input_with_default("[INPUT] Enter log directory", default_log_str)
+    log_root = Path(log_input).resolve()
+
+    suggested_haya = str(find_hayabusa_dir() or r"C:\tools\hayabusa")
+    hayabusa_dir = Path(get_input_with_default(
+        "[INPUT] Enter the Hayabusa *folder* (auto-detects latest hayabusa-*.exe)",
+        suggested_haya
+    )).resolve()
+
+    hayabusa_exe = find_latest_hayabusa(hayabusa_dir)
+    if hayabusa_exe is None:
+        print(f"[WARNING] No hayabusa*.exe found in {hayabusa_dir}. You may need to correct the folder later.")
+        hayabusa_exe = hayabusa_dir / "hayabusa.exe"
+
+    hayabusa_out_str = get_input_with_default(
+        "[INPUT] Enter path for Hayabusa output (blank = skip Hayabusa stages)",
+        r"E:\Results\Hayabusa"
+    )
+    hayabusa_out = Path(hayabusa_out_str).resolve() if hayabusa_out_str.strip() else None
+
+    suggested_7z = str(find_7zip() or r"C:\Program Files\7-Zip\7z.exe")
+    sevenzip_exe = Path(get_input_with_default(
+        "[INPUT] 7-Zip path",
+        suggested_7z
+    )).resolve()
+
+    suggested_recmd = str(find_recmd() or r"C:\tools\ZimmermanTools\net9\RECmd\RECmd.exe")
+    recmd_exe = Path(get_input_with_default(
+        "[INPUT] RECmd.exe path",
+        suggested_recmd
+    )).resolve()
+
+    default_kroll = r"C:\Tools\KAPE\Modules\bin\RECmd\BatchExamples\Kroll_Batch.reb"
+    kroll_batch = Path(get_input_with_default(
+        "[INPUT] Kroll_Batch.reb path (optional - leave default or blank if you don't have it)",
+        default_kroll
+    )).resolve()
+
+    if not sevenzip_exe.exists():
+        if input(f"\n7-Zip not found at {sevenzip_exe}. Change path? (y/n): ").strip().lower() == "y":
+            sevenzip_exe = Path(input("Enter path: ").strip().replace('"', "")).resolve()
+
+    if not recmd_exe.exists():
+        if input(f"RECmd not found at {recmd_exe}. Change path? (y/n): ").strip().lower() == "y":
+            recmd_exe = Path(input("Enter path: ").strip().replace('"', "")).resolve()
+
+    if not hayabusa_dir.exists() or not find_latest_hayabusa(hayabusa_dir):
+        if input(f"Hayabusa not found in {hayabusa_dir}. Change folder? (y/n): ").strip().lower() == "y":
+            hayabusa_dir = Path(input("Enter Hayabusa folder: ").strip().replace('"', "")).resolve()
+            hayabusa_exe = find_latest_hayabusa(hayabusa_dir) or (hayabusa_dir / "hayabusa.exe")
+
+    if hayabusa_exe and hayabusa_exe.exists():
+        print(f"[INFO] Hayabusa binary that will be used: {hayabusa_exe.name} ({get_hayabusa_version(hayabusa_exe)})")
+
+    return {
+        "source_root": source_root,
+        "unzip_root": unzip_root,
+        "output_root": output_root,
+        "log_root": log_root,
+        "hayabusa_dir": hayabusa_dir,
+        "hayabusa_exe": hayabusa_exe,
+        "hayabusa_out": hayabusa_out,
+        "sevenzip_exe": sevenzip_exe,
+        "recmd_exe": recmd_exe,
+        "kroll_batch": kroll_batch,
+    }
+
+
+def maybe_manage_scheduled_task(current_config, config_path, script_dir):
+    if os.name != "nt":
+        return
+
+    task_name = current_config.get("scheduled_task_name", "ForensicTriageParser")
+    frequency_minutes = scheduled_task_minutes_from_config(current_config)
+    task_exists = scheduled_task_exists(task_name)
+    script_path = Path(__file__).resolve()
+
+    if not task_exists:
+        print("\n[ SCHEDULER ] No scheduled task found for this parser.")
+        create = input(
+            f"Would you like to create a scheduled task that runs every {frequency_minutes} minutes using this config? (y/n): "
+        ).strip().lower()
+        if create == "y":
+            run_as_sys = input(
+                "Run the task as SYSTEM (requires Administrator) or current user? [S]ystem / [U]ser (default U): "
+            ).strip().lower()
+            create_or_update_scheduled_task(
+                task_name=task_name,
+                script_path=script_path,
+                config_path=config_path,
+                frequency_minutes=frequency_minutes,
+                run_as_system=(run_as_sys == "s"),
+                working_dir=script_dir,
+            )
+    else:
+        print(f"\n[ SCHEDULER ] A scheduled task named '{task_name}' already exists.")
+        action = input(
+            "What would you like to do? [U]pdate with current config, [R]emove task, or [S]kip: "
+        ).strip().lower()
+        if action == "u":
+            run_as_sys = input(
+                "Run as SYSTEM or current user? [S]ystem / [U]ser (default U): "
+            ).strip().lower()
+            create_or_update_scheduled_task(
+                task_name=task_name,
+                script_path=script_path,
+                config_path=config_path,
+                frequency_minutes=frequency_minutes,
+                run_as_system=(run_as_sys == "s"),
+                working_dir=script_dir,
+            )
+        elif action == "r":
+            delete_scheduled_task(task_name)
+
+
+def run_setup(config_path, script_dir, existing_config) -> dict:
+    use_prev = bool(existing_config) and (
+        input("\n[CONFIG] Use previous settings from config file? (y/n): ").strip().lower() == "y"
+    )
+    if use_prev and existing_config:
+        paths = load_paths_from_config(existing_config)
+        print("[CONFIG] Loaded previous settings successfully. Skipping path configuration.")
+        if paths["hayabusa_exe"] and paths["hayabusa_exe"].exists():
+            print(
+                f"[CONFIG] Using Hayabusa: {paths['hayabusa_exe'].name} "
+                f"({get_hayabusa_version(paths['hayabusa_exe'])})"
+            )
+        print(f"[CONFIG] Using RECmd: {paths['recmd_exe'].name if paths['recmd_exe'] else 'NOT FOUND'}")
+    else:
+        paths = prompt_paths_interactive()
+
+    do_recmd = input("\n[OPTION] Default: Run RECmd (Kroll_Batch)? (y/n): ").strip().lower() == "y"
+    do_hayabusa = input("[OPTION] Default: Run individual Hayabusa? (y/n): ").strip().lower() == "y"
+    do_bulk_hayabusa = input("[OPTION] Default: Run BULK Hayabusa? (y/n): ").strip().lower() == "y"
+
+    bulk_refresh_raw = input(
+        "[OPTION] Re-run bulk Hayabusa when new extract/CSV work appears? (y/n, default y): "
+    ).strip().lower()
+    bulk_refresh_on_new_work = bulk_refresh_raw != "n"
+
+    cpu_count = os.cpu_count() or 4
+    default_workers = min(12, max(4, cpu_count - 2))
+    prev_workers = None
+    if existing_config and existing_config.get("workers"):
+        try:
+            prev_workers = int(existing_config["workers"])
+        except (TypeError, ValueError):
+            prev_workers = None
+    prompt_default = prev_workers if prev_workers else default_workers
+    worker_input = input(f"[OPTION] Number of Stage 2 workers (default {prompt_default}): ").strip()
+    workers = int(worker_input) if worker_input else prompt_default
+
+    current_config = {
+        "source_root": str(paths["source_root"]),
+        "unzip_root": str(paths["unzip_root"]),
+        "output_root": str(paths["output_root"]),
+        "log_root": str(paths["log_root"]),
+        "hayabusa_dir": str(paths["hayabusa_dir"]),
+        "hayabusa_out": str(paths["hayabusa_out"]) if paths["hayabusa_out"] else None,
+        "sevenzip_exe": str(paths["sevenzip_exe"]),
+        "recmd_exe": str(paths["recmd_exe"]),
+        "kroll_batch_reb": str(paths["kroll_batch"]),
+        "scheduled_task_name": (existing_config or {}).get("scheduled_task_name", "ForensicTriageParser"),
+        "scheduled_task_minutes": scheduled_task_minutes_from_config(existing_config),
+        "do_recmd": do_recmd,
+        "do_hayabusa": do_hayabusa,
+        "do_bulk_hayabusa": do_bulk_hayabusa,
+        "bulk_refresh_on_new_work": bulk_refresh_on_new_work,
+        "force_reprocess": False,
+        "workers": workers,
+    }
+    save_config(config_path, current_config)
+    setup_logging(paths["log_root"])
+    logging.info("Setup mode: persistent config saved.")
+    maybe_manage_scheduled_task(current_config, config_path, script_dir)
+    print("\n[SETUP] Setup complete. Config saved.")
+    print(f"[SETUP] Config path: {config_path}")
+    return {**paths, "config": current_config}
+
+
+def run_pipeline(args, config, config_path, script_dir, paths: dict):
+    source_root = paths["source_root"]
+    unzip_root = paths["unzip_root"]
+    output_root = paths["output_root"]
+    log_root = paths["log_root"]
+    hayabusa_dir = paths["hayabusa_dir"]
+    hayabusa_exe = paths["hayabusa_exe"]
+    hayabusa_out = paths["hayabusa_out"]
+    sevenzip_exe = paths["sevenzip_exe"]
+    recmd_exe = paths["recmd_exe"]
+    kroll_batch = paths["kroll_batch"]
+
+    setup_logging(log_root)
+    logging.info(f"=== Forensic Triage Parser v{SCRIPT_VERSION} starting ===")
+    if args.non_interactive:
+        logging.info("Running in NON-INTERACTIVE / unattended mode (SYSTEM or scheduled task)")
+
+    items_to_process = select_items(source_root, non_interactive=args.non_interactive)
+
+    if not items_to_process:
+        print("[INFO] No collections to process right now. You can still configure stages and the scheduled task.")
+        logging.info("No collections found. Proceeding with configuration and scheduled task setup.")
+
+    if args.non_interactive:
+        do_recmd = resolve_bool_option(args.recmd, config, "do_recmd", False)
+        do_hayabusa = resolve_bool_option(args.hayabusa, config, "do_hayabusa", False)
+        do_bulk_hayabusa = resolve_bool_option(args.bulk_hayabusa, config, "do_bulk_hayabusa", False)
+        force_reprocess = resolve_bool_option(args.force_reprocess, config, "force_reprocess", False)
+        logging.info(
+            f"[NON-INTERACTIVE] Stages: recmd={do_recmd} hayabusa={do_hayabusa} "
+            f"bulk_hayabusa={do_bulk_hayabusa} force_reprocess={force_reprocess}"
+        )
+    else:
+        do_recmd = input("\n[OPTION] Run RECmd (Kroll_Batch)? (y/n): ").strip().lower() == "y"
+        do_hayabusa = input("[OPTION] Run individual Hayabusa? (y/n): ").strip().lower() == "y"
+        do_bulk_hayabusa = input("[OPTION] Run BULK Hayabusa? (y/n): ").strip().lower() == "y"
+        force_reprocess = input(
+            "\n[OPTION] Force re-extract and reprocess ALL collections? (y/n): "
+        ).strip().lower() == "y"
+        do_recmd = do_recmd or args.recmd
+        do_hayabusa = do_hayabusa or args.hayabusa
+        do_bulk_hayabusa = do_bulk_hayabusa or args.bulk_hayabusa
+        force_reprocess = force_reprocess or args.force_reprocess
+
+    bulk_refresh_on_new_work = bool(config.get("bulk_refresh_on_new_work", True))
+
+    if do_recmd:
+        recmd_parent = recmd_exe.parent if recmd_exe else None
+        kroll_batch = ensure_kroll_batch(kroll_batch, recmd_parent, non_interactive=args.non_interactive)
+
+    def _tool_ok(name: str, path: Path | None, required: bool = False) -> bool:
+        if path and path.exists():
+            return True
+        msg = f"[VALIDATION] {name} not found at expected location: {path}"
+        if required:
+            logging.error(msg)
+            print(msg)
+            print(f"[VALIDATION] Aborting: required tool '{name}' is missing.")
+            sys.exit(1)
+        logging.warning(msg)
+        print(msg)
+        return False
+
+    _tool_ok("7-Zip", sevenzip_exe, required=True)
+    if do_recmd:
+        _tool_ok("RECmd", recmd_exe, required=True)
+        if not kroll_batch.exists():
+            print(f"[VALIDATION] Kroll_Batch.reb still not available at {kroll_batch}")
+            print("             → RECmd will run in basic mode.")
+    if (do_hayabusa or do_bulk_hayabusa) and hayabusa_out:
+        _tool_ok("Hayabusa", hayabusa_exe)
+
+    start_time = time.time()
+    unzip_root.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+    if hayabusa_out:
+        hayabusa_out.mkdir(parents=True, exist_ok=True)
+
+    temp_spool_root = output_root / "_temp_json_spool"
+    temp_spool_root.mkdir(parents=True, exist_ok=True)
+
+    cpu_count = os.cpu_count() or 4
+    if args.workers is not None and args.workers > 0:
+        configured_workers = args.workers
+    elif config.get("workers"):
+        try:
+            configured_workers = int(config["workers"])
+        except (TypeError, ValueError):
+            configured_workers = None
+    else:
+        configured_workers = None
+
+    current_config = {
+        "source_root": str(source_root),
+        "unzip_root": str(unzip_root),
+        "output_root": str(output_root),
+        "log_root": str(log_root),
+        "hayabusa_dir": str(hayabusa_dir),
+        "hayabusa_out": str(hayabusa_out) if hayabusa_out else None,
+        "sevenzip_exe": str(sevenzip_exe),
+        "recmd_exe": str(recmd_exe),
+        "kroll_batch_reb": str(kroll_batch),
+        "scheduled_task_name": config.get("scheduled_task_name", "ForensicTriageParser"),
+        "scheduled_task_minutes": scheduled_task_minutes_from_config(config),
+        "do_recmd": do_recmd,
+        "do_hayabusa": do_hayabusa,
+        "do_bulk_hayabusa": do_bulk_hayabusa,
+        "bulk_refresh_on_new_work": bulk_refresh_on_new_work,
+        "force_reprocess": False,
+        "workers": configured_workers if configured_workers else (
+            max(2, cpu_count // 2) if args.non_interactive else min(12, max(4, cpu_count - 2))
+        ),
+    }
+    save_config(config_path, current_config)
+    logging.info("Persistent config saved.")
+
+    if not args.non_interactive:
+        maybe_manage_scheduled_task(current_config, config_path, script_dir)
+
+    stats = {"success": 0, "empty": 0, "error": 0, "skipped": 0}
+    run_errors = []
+    collection_status = {}
+    inventory = []
+    new_work_this_run = False
+    tasks = []
+
+    # ====================== STAGE 1: EXTRACTION + EARLY INDIVIDUAL HAYABUSA ======================
+    # Extract collections sequentially (or resume). As soon as a collection is ready and
+    # contains .evtx files, submit individual Hayabusa so it runs concurrently with
+    # remaining extractions. Bulk Hayabusa still waits until everything is extracted.
+    logging.info("STAGE 1: 7-ZIP EXTRACTION + early individual Hayabusa started")
+    print(f"\n{'#' * 20} STAGE 1: 7-ZIP EXTRACTION + EARLY HAYABUSA {'#' * 20}")
+
+    haya_tool_version = (
+        get_hayabusa_version(hayabusa_exe)
+        if hayabusa_exe and hayabusa_exe.exists() else "unknown"
+    )
+    haya_expected = {"stage": "hayabusa", "tool_version": haya_tool_version}
+    haya_count = 0
+    haya_skipped = 0
+    early_hayabusa_enabled = bool(
+        do_hayabusa and hayabusa_out and hayabusa_exe and hayabusa_exe.exists()
+    )
+
+    # Limit concurrent individual Hayabusa jobs so we don't overwhelm the machine
+    # while extractions are still running. 2–4 is a good default on most servers.
+    max_haya_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
+    haya_executor = None
+    haya_futures = {}
+
+    if early_hayabusa_enabled:
+        haya_executor = ThreadPoolExecutor(max_workers=max_haya_workers)
+        logging.info(
+            f"Early individual Hayabusa enabled (max {max_haya_workers} concurrent jobs)"
+        )
+        print(f"[INFO] Early individual Hayabusa will run as collections become ready "
+              f"(up to {max_haya_workers} concurrent)")
+
+    extracted_folders = []
+    for item in tqdm(items_to_process, desc="Extract + early Hayabusa", unit="collection"):
+        collection_name = item.stem if item.suffix.lower() == ".zip" else item.name
+        status = ensure_collection_status(collection_status, collection_name)
+        inventory.append(inventory_source_item(item))
+
+        target_path = unzip_root / collection_name
+        complete_marker = output_root / collection_name / STAGE_MARKER_NAME
+        if has_stage_complete(complete_marker) and not force_reprocess:
+            if target_path.exists():
+                logging.info(f"SKIPPED collection {collection_name} - completion marker exists")
+                print(f" [SKIP] {collection_name} - already fully processed (CSV stage)")
+                status["extract"] = "skipped"
+                extracted_folders.append(target_path)
+                # Always check/run individual Hayabusa for already-extracted collections
+                # when the Hayabusa marker or output is missing.
+                if early_hayabusa_enabled:
+                    fut = haya_executor.submit(
+                        process_individual_hayabusa,
+                        target_path,
+                        hayabusa_exe,
+                        hayabusa_out,
+                        haya_tool_version,
+                        haya_expected,
+                        force_reprocess,
+                    )
+                    haya_futures[fut] = collection_name
+                    print(f" [HAYA] Checking/queuing Hayabusa for already-extracted {collection_name}")
+                continue
+            logging.info(
+                f"RE-EXTRACT needed for {collection_name}: CSV complete but extract folder missing"
+            )
+            print(f" [RE-EXTRACT] {collection_name} - complete marker present but extract missing")
+
+        if target_path.exists():
+            if force_reprocess:
+                logging.info(f"FORCE deleting prior extraction for {collection_name}")
+                print(f" [FORCE] Deleting previous extraction of {collection_name}")
+                shutil.rmtree(target_path, ignore_errors=True)
+                clear_stage_complete(complete_marker)
+            else:
+                logging.info(f"RESUME extraction exists for {collection_name}")
+                print(f" [RESUME] {collection_name} - extraction already exists")
+                status["extract"] = "skipped"
+        if not target_path.exists():
+            if item.suffix.lower() == ".zip":
+                logging.info(f"Extracting ZIP: {item}")
+                print(f" [7Z] Extracting: {item.name}")
+                if not run_7zip_extract(sevenzip_exe, item, target_path):
+                    logging.error(f"Extraction failed for {item}")
+                    record_error(run_errors, "extract", collection_name, f"Extraction failed for {item}")
+                    status["extract"] = "failed"
+                    continue
+            else:
+                logging.info(f"Copying folder collection: {item}")
+                try:
+                    shutil.copytree(item, target_path)
+                except Exception as e:
+                    record_error(run_errors, "extract", collection_name, f"Copy failed: {e}")
+                    status["extract"] = "failed"
+                    continue
+            new_work_this_run = True
+            status["extract"] = "success"
+        else:
+            if status["extract"] is None:
+                status["extract"] = "skipped"
+
+        extracted_folders.append(target_path)
+
+        # Kick off individual Hayabusa as soon as this collection is ready
+        if early_hayabusa_enabled and target_path.exists():
+            fut = haya_executor.submit(
+                process_individual_hayabusa,
+                target_path,
+                hayabusa_exe,
+                hayabusa_out,
+                haya_tool_version,
+                haya_expected,
+                force_reprocess,
+            )
+            haya_futures[fut] = collection_name
+            print(f" [HAYA] Queued individual Hayabusa for {collection_name}")
+
+    # Wait for any remaining early Hayabusa jobs before moving on
+    if haya_futures:
+        print(f"\n[INFO] Waiting for {len(haya_futures)} early individual Hayabusa job(s) to finish...")
+        logging.info(f"Waiting for {len(haya_futures)} early Hayabusa futures")
+        for fut in as_completed(haya_futures):
+            collection_name = haya_futures[fut]
+            status = ensure_collection_status(collection_status, collection_name)
+            try:
+                res = fut.result()
+                st = res.get("status", "failed")
+                status["hayabusa"] = st
+                if st == "success":
+                    haya_count += 1
+                    print(f" [HAYA] Finished {collection_name}")
+                elif res.get("skipped"):
+                    haya_skipped += 1
+                    logging.info(f"Hayabusa skipped for {collection_name}: {res.get('message')}")
+                else:
+                    record_error(run_errors, "hayabusa", collection_name, res.get("message", "Hayabusa failed"))
+                    print(f" [HAYA] Failed {collection_name}")
+            except Exception as e:
+                status["hayabusa"] = "failed"
+                record_error(run_errors, "hayabusa", collection_name, str(e))
+                logging.error(f"Early Hayabusa future failed for {collection_name}: {e}")
+
+    if haya_executor is not None:
+        haya_executor.shutdown(wait=True)
+
+    logging.info(
+        f"STAGE 1 complete - {len(extracted_folders)} collections ready; "
+        f"early Hayabusa: {haya_count} success, {haya_skipped} skipped"
+    )
+    print(f"[INFO] Extraction finished. Early Hayabusa: {haya_count} completed, {haya_skipped} skipped.")
+
+    # ====================== STAGE 2: JSON TO CSV ======================
+    logging.info("STAGE 2: JSON TO CSV started")
+    print(f"\n{'#' * 20} STAGE 2: JSON TO CSV {'#' * 20}")
+    skipped_collections = 0
+    print("[INFO] Building Stage 2 task list...")
+    logging.info("Building Stage 2 task list")
+    for folder in tqdm(extracted_folders, desc="Scanning collections", unit="collection"):
+        collection_name = folder.name
+        status = ensure_collection_status(collection_status, collection_name)
+        complete_marker = output_root / collection_name / STAGE_MARKER_NAME
+        if has_stage_complete(complete_marker) and not force_reprocess:
+            skipped_collections += 1
+            status["csv"] = "skipped"
+            logging.info(f"SKIPPED JSON conversion for {collection_name} - completion marker exists")
+            continue
+        found_any = False
+        for results_dir in folder.rglob("results"):
+            if not results_dir.is_dir():
+                continue
+            for json_file in results_dir.rglob("*.json"):
+                tasks.append((str(json_file), str(results_dir), str(output_root), collection_name))
+                found_any = True
+        if not found_any:
+            logging.info(f"No JSON files found under results folders for collection: {collection_name}")
+    logging.info(f"Stage 2 task discovery complete. Queued {len(tasks)} JSON files.")
+    print(f"[INFO] Stage 2 task discovery complete. Queued {len(tasks)} JSON files.")
+    if skipped_collections:
+        print(f"[INFO] Skipped {skipped_collections} collections due to existing completion markers.")
+
+    if tasks:
+        cpu_count = os.cpu_count() or 4
+        default_workers = (
+            max(2, cpu_count // 2) if args.non_interactive
+            else min(12, max(4, cpu_count - 2))
+        )
+        if args.workers is not None and args.workers > 0:
+            num_workers = args.workers
+            do_sort_large_first = False if args.non_interactive else (
+                input("[OPTION] Sort files by size before processing? (y/n, default n): ").strip().lower() == "y"
+            )
+        elif args.non_interactive:
+            num_workers = configured_workers if configured_workers else default_workers
+            do_sort_large_first = False
+            logging.info(f"[NON-INTERACTIVE] Using {num_workers} workers")
+        else:
+            prompt_default = configured_workers if configured_workers else default_workers
+            worker_input = input(f"[OPTION] Number of Stage 2 workers (default {prompt_default}): ").strip()
+            num_workers = int(worker_input) if worker_input else prompt_default
+            do_sort_large_first = input(
+                "[OPTION] Sort files by size before processing? (y/n, default n): "
+            ).strip().lower() == "y"
+
+        current_config["workers"] = num_workers
+        save_config(config_path, current_config)
+
+        if do_sort_large_first:
+            print("[INFO] Sorting tasks by file size...")
+            logging.info("Sorting Stage 2 tasks by file size")
+            try:
+                tasks.sort(key=lambda t: Path(t[0]).stat().st_size, reverse=True)
+            except Exception as e:
+                logging.warning(f"Could not sort tasks by size: {e}")
+
+        logging.info(f"Found {len(tasks)} JSON files for conversion")
+        logging.info(f"Using {num_workers} workers for Stage 2")
+        print(f"[INFO] Found {len(tasks)} JSON files. Starting conversion with ultra-fast large-file path...")
+        process_tasks_parallel(tasks, stats, num_workers, temp_spool_root=temp_spool_root)
+
+        if stats.get("error", 0):
+            record_error(
+                run_errors,
+                "csv",
+                None,
+                f"{stats['error']} JSON conversion error(s) during Stage 2",
+            )
+
+        logging.info("Creating completion markers for fully processed collections")
+        print("[INFO] Verifying collection completion markers...")
+        for folder in tqdm(extracted_folders, desc="Finalizing collections", unit="collection"):
+            collection_name = folder.name
+            status = ensure_collection_status(collection_status, collection_name)
+            complete_marker = output_root / collection_name / STAGE_MARKER_NAME
+            if has_stage_complete(complete_marker) and not force_reprocess:
+                if status["csv"] is None:
+                    status["csv"] = "skipped"
+                continue
+            json_count = count_results_json(folder)
+            csv_count = sum(1 for _ in (output_root / collection_name).rglob("*.csv"))
+            if json_count > 0 and csv_count >= json_count:
+                mark_stage_complete(complete_marker, {"stage": "csv"})
+                new_work_this_run = True
+                status["csv"] = "success"
+                logging.info(f"Completion marker created for {collection_name}")
+            elif json_count > 0:
+                status["csv"] = "failed"
+                record_error(
+                    run_errors,
+                    "csv",
+                    collection_name,
+                    f"Incomplete CSV conversion ({csv_count}/{json_count} files)",
+                )
+
+    # ====================== STAGE 3: RECmd ======================
+    recmd_count = 0
+    recmd_skipped = 0
+    recmd_tool_version = get_recmd_version(recmd_exe) if recmd_exe else "unknown"
+    kroll_sha_for_marker = None
+    if kroll_batch and kroll_batch.exists():
+        try:
+            if verify_kroll_sha256(kroll_batch):
+                # Record the actual digest of the batch file that will be used
+                kroll_sha_for_marker = file_sha256(kroll_batch).lower()
+        except Exception:
+            kroll_sha_for_marker = None
+    recmd_expected = {
+        "stage": "recmd",
+        "tool_version": recmd_tool_version,
+        "kroll_sha256": kroll_sha_for_marker,
+    }
+
+    if do_recmd:
+        logging.info("STAGE 3: RECmd started")
+        print(f"\n{'#' * 20} STAGE 3: RECMD (Registry Parsing) {'#' * 20}")
+        for folder in tqdm(extracted_folders, desc="RECmd", unit="collection"):
+            status = ensure_collection_status(collection_status, folder.name)
+            if not folder.exists():
+                logging.warning(f"RECmd skipped for {folder.name} - extract folder missing")
+                status["recmd"] = "failed"
+                record_error(run_errors, "recmd", folder.name, "Extract folder missing")
+                continue
+            collection_recmd_dir = output_root / f"{folder.name}-RECMD-OUTPUT"
+            recmd_marker = collection_recmd_dir / STAGE_MARKER_NAME
+
+            if force_reprocess:
+                clear_stage_complete(recmd_marker)
+                if collection_recmd_dir.exists():
+                    shutil.rmtree(collection_recmd_dir, ignore_errors=True)
+            elif has_stage_complete(recmd_marker, recmd_expected):
+                recmd_skipped += 1
+                status["recmd"] = "skipped"
+                logging.info(f"SKIPPED RECmd for {folder.name} - already complete")
+                print(f" [SKIP] RECmd {folder.name}")
+                continue
+
+            collection_recmd_dir.mkdir(parents=True, exist_ok=True)
+            ok, used_batch = run_recmd_cmd(recmd_exe, folder, collection_recmd_dir, kroll_batch)
+            if ok:
+                mark_stage_complete(recmd_marker, {
+                    "stage": "recmd",
+                    "tool_version": recmd_tool_version,
+                    "kroll_sha256": kroll_sha_for_marker,
+                })
+                recmd_count += 1
+                status["recmd"] = "success"
+                if not used_batch:
+                    logging.info(f"RECmd for {folder.name} ran without Kroll batch (basic mode)")
+            else:
+                status["recmd"] = "failed"
+                record_error(run_errors, "recmd", folder.name, "RECmd failed")
+        logging.info(
+            f"STAGE 3 complete - {recmd_count} processed, {recmd_skipped} skipped"
+        )
+        if recmd_skipped:
+            print(f"[INFO] RECmd skipped {recmd_skipped} already-complete collections.")
+
+    # ====================== STAGE 4: INDIVIDUAL HAYABUSA (already handled early) ======================
+    # Individual Hayabusa was started as soon as each collection finished extracting
+    # (see Stage 1). We only log a summary here so the final report still has the numbers.
+    if early_hayabusa_enabled:
+        logging.info(
+            f"STAGE 4 (early individual Hayabusa) already completed during extraction — "
+            f"{haya_count} success, {haya_skipped} skipped"
+        )
+        print(f"\n[INFO] Individual Hayabusa already ran during Stage 1 "
+              f"({haya_count} completed, {haya_skipped} skipped).")
+    elif do_hayabusa:
+        logging.warning("Hayabusa individual requested but no valid hayabusa_exe found. Skipping.")
+
+    # ====================== STAGE 5: BULK HAYABUSA ======================
+    bulk_status = "N/A"
+    bulk_skipped = False
+    bulk_expected = {"stage": "hayabusa_bulk", "tool_version": haya_tool_version}
+
+    if do_bulk_hayabusa and hayabusa_out and hayabusa_exe and hayabusa_exe.exists():
+        logging.info("STAGE 5: BULK HAYABUSA started")
+        print(f"\n{'#' * 20} STAGE 5: BULK HAYABUSA {'#' * 20}")
+        bulk_csv = hayabusa_out / "BULK_ALL_TRIAGES.csv"
+        bulk_marker = hayabusa_out / "BULK_ALL_TRIAGES.COMPLETE"
+
+        should_skip_bulk = (
+            has_stage_complete(bulk_marker, bulk_expected)
+            and not force_reprocess
+            and not (new_work_this_run and bulk_refresh_on_new_work)
+        )
+        if should_skip_bulk:
+            bulk_skipped = True
+            bulk_status = "Skipped"
+            logging.info(
+                "SKIPPED bulk Hayabusa - already complete and no new extract/CSV work this run "
+                "(or bulk_refresh_on_new_work disabled)"
+            )
+            print("[SKIP] Bulk Hayabusa - already complete (no new collections this run)")
+        else:
+            if force_reprocess or (new_work_this_run and bulk_refresh_on_new_work):
+                clear_stage_complete(bulk_marker)
+                if bulk_csv.exists():
+                    try:
+                        bulk_csv.unlink()
+                    except OSError as e:
+                        logging.warning(f"Could not remove prior bulk Hayabusa CSV {bulk_csv}: {e}")
+            if run_hayabusa_cmd(hayabusa_exe, unzip_root, bulk_csv):
+                mark_stage_complete(bulk_marker, {
+                    "stage": "hayabusa_bulk",
+                    "tool_version": haya_tool_version,
+                })
+                bulk_status = "Success"
+            else:
+                bulk_status = "Failed"
+                record_error(run_errors, "hayabusa_bulk", None, "Bulk Hayabusa failed")
+        logging.info(f"STAGE 5 complete - status: {bulk_status}")
+    elif do_bulk_hayabusa:
+        logging.warning("Bulk Hayabusa requested but no valid hayabusa_exe found. Skipping.")
+
+    # ====================== INVENTORY + FINAL REPORT ======================
+    total_time = time.time() - start_time
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    inventory_path = output_root / f"collection_inventory_{timestamp}.json"
+    try:
+        with open(inventory_path, "w", encoding="utf-8") as f:
+            json.dump(inventory, f, indent=2, ensure_ascii=False)
+        logging.info(f"Collection inventory written: {inventory_path}")
+    except Exception as e:
+        logging.error(f"Failed to write inventory JSON: {e}")
+        inventory_path = None
+
+    summary = {
+        "script_version": SCRIPT_VERSION,
+        "run_start": datetime.fromtimestamp(start_time).isoformat(),
+        "run_end": datetime.now().isoformat(),
+        "total_duration_seconds": round(total_time, 2),
+        "source_root": str(source_root),
+        "output_root": str(output_root),
+        "tools": {
+            "7zip": str(sevenzip_exe) if sevenzip_exe else None,
+            "recmd": str(recmd_exe) if recmd_exe else None,
+            "hayabusa": str(hayabusa_exe) if hayabusa_exe else None,
+            "hayabusa_version": (
+                get_hayabusa_version(hayabusa_exe)
+                if hayabusa_exe and hayabusa_exe.exists() else "N/A"
+            ),
+            "kroll_batch": str(kroll_batch) if kroll_batch else None,
+        },
+        "options": {
+            "do_recmd": do_recmd,
+            "do_hayabusa_individual": do_hayabusa,
+            "do_hayabusa_bulk": do_bulk_hayabusa,
+            "bulk_refresh_on_new_work": bulk_refresh_on_new_work,
+            "force_reprocess": force_reprocess,
+            "workers": current_config.get("workers"),
+        },
+        "json_conversion": {
+            "success": stats.get("success", 0),
+            "empty": stats.get("empty", 0),
+            "skipped": stats.get("skipped", 0),
+            "error": stats.get("error", 0),
+            "total_files_queued": len(tasks),
+        },
+        "recmd": {
+            "collections_processed": recmd_count,
+            "collections_skipped": recmd_skipped,
+            "total_collections": len(extracted_folders),
+        },
+        "hayabusa": {
+            "individual_success": haya_count,
+            "individual_skipped": haya_skipped,
+            "bulk_status": bulk_status,
+            "bulk_skipped": bulk_skipped,
+        },
+        "errors": run_errors,
+        "error_count": len(run_errors),
+        "collections": collection_status,
+        "inventory_path": str(inventory_path) if inventory_path else None,
+        "inventory_count": len(inventory),
+        "completion_markers_created": True,
+    }
+
+    summary_json_path = output_root / f"Forensic_Triage_Summary_{timestamp}.json"
+    summary_txt_path = output_root / f"Forensic_Triage_Summary_{timestamp}.txt"
+
+    try:
+        with open(summary_json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        logging.info(f"Structured summary JSON written: {summary_json_path}")
+
+        last_json = output_root / "last_run_summary.json"
+        with open(last_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        logging.info(f"Latest summary also available at: {last_json}")
+    except Exception as e:
+        logging.error(f"Failed to write summary JSON: {e}")
+
+    try:
+        with open(summary_txt_path, "w", encoding="utf-8") as f:
+            f.write("=" * 70 + "\n")
+            f.write(f" FORENSIC TRIAGE PARSER - RUN SUMMARY (v{SCRIPT_VERSION})\n")
+            f.write("=" * 70 + "\n\n")
+            f.write(f"Run completed: {summary['run_end']}\n")
+            f.write(f"Total duration: {summary['total_duration_seconds']:.1f} seconds\n")
+            f.write(f"Recorded errors: {summary['error_count']}\n\n")
+
+            f.write("TOOLS USED\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"  7-Zip     : {summary['tools']['7zip']}\n")
+            f.write(f"  RECmd     : {summary['tools']['recmd']}\n")
+            f.write(f"  Hayabusa  : {summary['tools']['hayabusa']} ({summary['tools']['hayabusa_version']})\n")
+            f.write(f"  Kroll Batch: {summary['tools']['kroll_batch']}\n\n")
+
+            f.write("JSON → CSV CONVERSION\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"  Successful : {summary['json_conversion']['success']}\n")
+            f.write(f"  Empty      : {summary['json_conversion']['empty']}\n")
+            f.write(f"  Skipped    : {summary['json_conversion']['skipped']}\n")
+            f.write(f"  Errors     : {summary['json_conversion']['error']}\n\n")
+
+            if do_recmd:
+                f.write("RECmd (Registry)\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"  Collections processed: {summary['recmd']['collections_processed']}\n")
+                f.write(f"  Collections skipped  : {summary['recmd']['collections_skipped']}\n\n")
+
+            if do_hayabusa or do_bulk_hayabusa:
+                f.write("HAYABUSA\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"  Individual successes : {summary['hayabusa']['individual_success']}\n")
+                f.write(f"  Individual skipped   : {summary['hayabusa']['individual_skipped']}\n")
+                f.write(f"  Bulk status          : {summary['hayabusa']['bulk_status']}\n\n")
+
+            f.write("INVENTORY\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"  Collections inventoried: {summary['inventory_count']}\n")
+            f.write(f"  Inventory file         : {summary['inventory_path']}\n\n")
+
+            f.write("OUTPUT LOCATIONS\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"  CSV Output     : {output_root}\n")
+            if hayabusa_out:
+                f.write(f"  Hayabusa Output: {hayabusa_out}\n")
+            f.write(f"  Log file       : {log_root}\n")
+            f.write(f"  Summary JSON   : {summary_json_path}\n")
+            f.write(f"  Summary TXT    : {summary_txt_path}\n\n")
+
+            f.write("=" * 70 + "\n")
+            f.write(" End of summary report\n")
+            f.write("=" * 70 + "\n")
+        logging.info(f"Human-readable summary written: {summary_txt_path}")
+
+        last_txt = output_root / "last_run_summary.txt"
+        with open(last_txt, "w", encoding="utf-8") as f:
+            f.write(open(summary_txt_path, "r", encoding="utf-8").read())
+        logging.info(f"Latest human-readable summary: {last_txt}")
+    except Exception as e:
+        logging.error(f"Failed to write summary TXT: {e}")
+
+    print("\n" + "=" * 60)
+    print(" FINAL PARSING OVERVIEW ")
+    print("=" * 60)
+    print(f" JSON Files Processed : {stats['success']}")
+    print(f" Empty JSONs Flagged : {stats['empty']}")
+    print(f" Skipped (up-to-date) : {stats['skipped']}")
+    print(f" Errors : {stats['error']}")
+    print(f" Recorded run errors : {len(run_errors)}")
+    if do_recmd:
+        print(f" RECmd processed/skipped: {recmd_count}/{recmd_skipped} (of {len(extracted_folders)})")
+    if do_hayabusa:
+        print(f" Individual Hayabusa processed/skipped: {haya_count}/{haya_skipped}")
+    if do_bulk_hayabusa:
+        print(f" Bulk Hayabusa : {bulk_status}")
+    print(f" Inventory entries : {len(inventory)}")
+    print(f" Total Execution Time : {total_time:.2f} seconds")
+    print(f"\n Structured reports written to: {output_root}")
+    print("=" * 60)
+    logging.info(f"Run complete - Total time: {total_time:.2f} seconds")
+
+    try:
+        if temp_spool_root.exists():
+            shutil.rmtree(temp_spool_root, ignore_errors=True)
+            logging.info(f"Deleted temp spool directory: {temp_spool_root}")
+    except Exception as e:
+        logging.warning(f"Could not delete temp spool directory {temp_spool_root}: {e}")
+
+    if args.non_interactive:
+        cleanup = False
+        logging.info("[NON-INTERACTIVE] Skipping extracted folder cleanup (default behavior for automation)")
+    else:
+        cleanup = input(
+            "\n[OPTION] Delete all extracted folders to save disk space? (y/n, default n): "
+        ).strip().lower() == "y"
+
+    if cleanup:
+        logging.info("User requested cleanup of extracted folders")
+        print("[CLEANUP] Deleting extracted folders...")
+        for folder in tqdm(extracted_folders, desc="Cleaning up", unit="collection"):
+            if folder.exists():
+                shutil.rmtree(folder, ignore_errors=True)
+                logging.info(f"Deleted extracted folder: {folder.name}")
+        print("[CLEANUP] All extracted folders removed.")
+    else:
+        logging.info("Cleanup skipped - extracted folders preserved")
+
+    logging.info("=== Forensic Triage Parser Finished ===")
+    print(f"[INFO] All done. Logs saved to: {log_root}")
+    print("[INFO] Log file and completion markers provide an audit trail of processing.")
+
+
+def main():
+    global VERBOSE
+    multiprocessing.freeze_support()
+
+    parser = argparse.ArgumentParser(
+        description=f"Forensic Triage Parser for Velociraptor collections (v{SCRIPT_VERSION})"
+    )
+    parser.add_argument("--non-interactive", "-ni", action="store_true",
+                        help="Run without any interactive prompts (for scheduled tasks / automation)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to a specific config file")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel workers for JSON→CSV conversion")
+    parser.add_argument("--recmd", action="store_true",
+                        help="Enable RECmd stage (overrides config when set)")
+    parser.add_argument("--hayabusa", action="store_true",
+                        help="Enable individual Hayabusa stage (overrides config when set)")
+    parser.add_argument("--bulk-hayabusa", action="store_true",
+                        help="Enable bulk Hayabusa stage (overrides config when set)")
+    parser.add_argument("--force-reprocess", action="store_true",
+                        help="Force re-extract and reprocess all collections (overrides config when set)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable verbose subprocess logging")
+    parser.add_argument("--setup", action="store_true",
+                        help="Interactive setup only (paths, stage defaults, scheduled task); then exit")
+    args = parser.parse_args()
+
+    VERBOSE = bool(args.verbose)
+
+    script_dir = Path(__file__).parent.resolve()
+    config_path = Path(args.config).resolve() if args.config else (script_dir / "velo_triage_config.json")
+
+    output_root = Path(r"E:\Results\CSVOutput")
+    log_root = output_root / "logs"
+    config = load_config(config_path)
+    if config.get("output_root"):
+        output_root = Path(config["output_root"]).resolve()
+    if config.get("log_root"):
+        log_root = Path(config["log_root"]).resolve()
+    else:
+        log_root = (output_root / "logs").resolve()
+
+    print("=" * 70)
+    print(f" FORENSIC TRIAGE PARSER - Velociraptor (v{SCRIPT_VERSION})")
+    print(" Two-pass direct CSV  |  Dynamic Hayabusa  |  Structured final reports")
+    if args.non_interactive:
+        print(" Running in NON-INTERACTIVE mode (suitable for scheduled tasks)")
+    if args.setup:
+        print(" Running in SETUP mode")
+    print("=" * 70)
+
+    if args.setup and args.non_interactive:
+        print("[ERROR] --setup cannot be combined with --non-interactive.")
+        sys.exit(1)
+
+    if args.setup:
+        run_setup(config_path, script_dir, config)
+        return
+
+    try:
+        if args.non_interactive:
+            if not config_path.exists() or not config:
+                msg = (
+                    f"[NON-INTERACTIVE] Config required but missing or empty: {config_path}. "
+                    "Run interactively once to create it, or pass --config to a valid JSON file."
+                )
+                print(msg)
+                try:
+                    setup_logging(log_root)
+                    logging.error(msg)
+                except Exception:
+                    pass
+                sys.exit(1)
+            paths = load_paths_from_config(config)
+            print("[NON-INTERACTIVE] Using config file settings (no prompts).")
+        else:
+            use_prev = bool(config) and (
+                input("\n[CONFIG] Use previous settings from config file? (y/n): ").strip().lower() == "y"
+            )
+            if use_prev and config:
+                paths = load_paths_from_config(config)
+                print("[CONFIG] Loaded previous settings successfully. Skipping path configuration.")
+                if paths["hayabusa_exe"] and paths["hayabusa_exe"].exists():
+                    print(
+                        f"[CONFIG] Using Hayabusa: {paths['hayabusa_exe'].name} "
+                        f"({get_hayabusa_version(paths['hayabusa_exe'])})"
+                    )
+                print(
+                    f"[CONFIG] Using RECmd: "
+                    f"{paths['recmd_exe'].name if paths['recmd_exe'] else 'NOT FOUND'}"
+                )
+            else:
+                paths = prompt_paths_interactive()
+
+        output_root = paths["output_root"]
+        run_pipeline(args, config, config_path, script_dir, paths)
+
+    except Exception as e:
+        logging.critical(f"UNHANDLED EXCEPTION: {e}", exc_info=True)
+        try:
+            failure = {
+                "run_end": datetime.now().isoformat(),
+                "status": "CRASHED",
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+            crash_dir = Path(output_root)
+            crash_dir.mkdir(parents=True, exist_ok=True)
+            last_json = crash_dir / "last_run_summary.json"
+            with open(last_json, "w", encoding="utf-8") as f:
+                json.dump(failure, f, indent=2)
+            logging.info(f"Failure summary written to {last_json}")
+        except Exception:
+            pass
+        raise
+
+
+if __name__ == "__main__":
+    main()
