@@ -2,7 +2,7 @@ import { ClipboardList } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { assignedTo, foldAssignments, normalizeInitials, type AssignEvent, type AssignMap } from "@/lib/ftp/collab";
+import { assignedTo, foldAssignments, isSeatInitials, normalizeInitials, type AssignEvent, type AssignMap } from "@/lib/ftp/collab";
 import { cn } from "@/lib/utils";
 
 export type Assignable = { id: string; title: string; subtitle: string };
@@ -54,7 +54,7 @@ export function AssignPanel({
         <div>
           <p className="text-sm font-medium">Assign collections</p>
           <p className="mt-1 max-w-xl text-xs text-muted">
-            Case lead types initials — or take hosts yourself. No accounts.
+            Case lead types 2–3 letters — or take hosts yourself. Duplicate AA? Use AAM.
           </p>
         </div>
       </div>
@@ -84,12 +84,12 @@ export function AssignPanel({
             id="assign-initials"
             value={initials}
             onChange={(e) => setInitials(e.target.value)}
-            placeholder="AA"
-            maxLength={8}
-            className="mt-1 h-11 w-28 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase"
+            placeholder="AAM"
+            maxLength={3}
+            className="mt-1 h-11 w-16 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase"
           />
         </div>
-        <Button type="button" size="sm" disabled={!picked.length && !who} onClick={() => go(who)}>
+        <Button type="button" size="sm" disabled={!picked.length && !isSeatInitials(who)} onClick={() => go(who)}>
           {who ? `Give ${picked.length ? picked.length : "open"} to ${who}` : "Unassign selected"}
         </Button>
         {self ? (

@@ -90,7 +90,7 @@ export function PathsPanel({
         <Field id="path-unzip" label="Extract to" hint="Unpacked trees (dotfiles preserved)" value={paths.unzipRoot} onChange={(unzipRoot) => onChange({ ...paths, unzipRoot })} />
         <Field id="path-out" label="Results" hint="CSV, digest, inventory per host" value={paths.outputRoot} onChange={(outputRoot) => onChange({ ...paths, outputRoot })} />
         <Field id="path-db" label="Case database" hint="Shared SQLite on the lab share" value={paths.dbPath} onChange={(dbPath) => onChange({ ...paths, dbPath })} />
-        <Field id="path-analyst" label="Analyst" hint="Initials stamped on check-offs" value={paths.analyst} onChange={(analyst) => onChange({ ...paths, analyst })} />
+        <Field id="path-analyst" label="Analyst" hint="2 letters, or 3 if two people share a pair" value={paths.analyst} onChange={(analyst) => onChange({ ...paths, analyst: analyst.replace(/[^A-Za-z]/g, "").slice(0, 3) })} />
       </div>
 
       {warns.length ? (

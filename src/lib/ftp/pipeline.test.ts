@@ -5,7 +5,7 @@ import { inventoryCsv, toCsv } from "./csv.ts";
 import { buildFleet } from "./inventory.ts";
 import { planStages } from "./plan.ts";
 import { millCommand, pathWarnings, pathsConfig, trimPaths, parsedDiskPath, folderOf, joinWin } from "./paths.ts";
-import { foldAssignments, foldEvents, foldLead, foldRoster, makeAssign, makeEvent, makeLead, makeRoster, mergeEventLogs, teamList } from "./collab.ts";
+import { foldAssignments, foldEvents, foldLead, foldRoster, isSeatInitials, makeAssign, makeEvent, makeLead, makeRoster, mergeEventLogs, normalizeInitials, teamList } from "./collab.ts";
 import { runPipeline } from "./pipeline.ts";
 
 describe("ftp 5.0 auto mill", () => {
@@ -123,6 +123,19 @@ describe("ftp 5.0 auto mill", () => {
     const team = teamList(dropped, map, "jw");
     assert.ok(team.includes("AA"));
     assert.ok(team.includes("ZZ"));
+  });
+
+  it("initials are 2 or 3 letters so duplicate pairs can split", () => {
+    assert.equal(normalizeInitials("aa"), "AA");
+    assert.equal(normalizeInitials("aam"), "AAM");
+    assert.equal(normalizeInitials("aamx"), "AAM");
+    assert.equal(isSeatInitials("a"), false);
+    assert.equal(isSeatInitials("aa"), true);
+    assert.equal(isSeatInitials("aam"), true);
+    const events = [makeRoster("AA", "add", "AA", "a"), makeRoster("AAM", "add", "AA", "a")];
+    const roster = foldRoster(events);
+    assert.ok(roster.includes("AA"));
+    assert.ok(roster.includes("AAM"));
   });
 
   it("case lead locks after claim; only current lead can pass", () => {

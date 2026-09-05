@@ -3,7 +3,7 @@ import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type { Presence } from "@/lib/ftp/collab";
-import { livePresence, normalizeInitials } from "@/lib/ftp/collab";
+import { isSeatInitials, livePresence, normalizeInitials } from "@/lib/ftp/collab";
 import { cn } from "@/lib/utils";
 
 export type TeamRow = {
@@ -39,7 +39,7 @@ export function TeamPanel({
   const who = normalizeInitials(draft);
 
   function add() {
-    if (!who) return;
+    if (!isSeatInitials(who)) return;
     onAdd(who);
     setDraft("");
   }
@@ -51,7 +51,7 @@ export function TeamPanel({
           <UserPlus className="mt-0.5 size-4 text-accent" />
           <div>
             <p className="text-sm font-medium">Team · {team.length}</p>
-            <p className="mt-1 max-w-xl text-xs text-muted">Add initials, assign hosts, pin anyone’s pile. Case lead is locked in the header — only they can pass it.</p>
+            <p className="mt-1 max-w-xl text-xs text-muted">2 or 3 letters. If two AAs are on the case, one uses AAM. Case lead is locked in the header.</p>
           </div>
         </div>
         <div className="flex flex-wrap items-end gap-2">
@@ -62,11 +62,11 @@ export function TeamPanel({
             onKeyDown={(e) => {
               if (e.key === "Enter") add();
             }}
-            placeholder="MK"
-            maxLength={8}
-            className="h-11 w-24 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase"
+            placeholder="AAM"
+            maxLength={3}
+            className="h-11 w-16 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase"
           />
-          <Button type="button" size="sm" disabled={!who} onClick={add}>
+          <Button type="button" size="sm" disabled={!isSeatInitials(who)} onClick={add}>
             Add
           </Button>
         </div>

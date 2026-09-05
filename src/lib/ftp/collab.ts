@@ -85,7 +85,17 @@ export function newSeatId(slot = "a") {
 }
 
 export function normalizeInitials(raw: string): string {
-  return raw.trim().toUpperCase().slice(0, 8);
+  return raw
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .slice(0, 3);
+}
+
+/** Two letters by default; a third letter when two people share a pair (AA vs AAM). */
+export function isSeatInitials(raw: string): boolean {
+  const n = normalizeInitials(raw);
+  return n.length === 2 || n.length === 3;
 }
 
 export function channelName(dbPath: string) {

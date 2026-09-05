@@ -41,6 +41,7 @@ import {
   mergeLeadLogs,
   mergeRosterLogs,
   newSeatId,
+  isSeatInitials,
   normalizeInitials,
   occupants,
   teamList,
@@ -376,8 +377,8 @@ export function Workbench() {
   }
   function claimLead() {
     const who = normalizeInitials(paths.analyst);
-    if (!who) {
-      setNotice("Set your initials first, then claim lead.");
+    if (!isSeatInitials(who)) {
+      setNotice("Set 2 or 3 letter initials first, then claim lead.");
       return;
     }
     if (foldLead(leads) && !canChangeLead(foldLead(leads), who)) {
@@ -395,8 +396,8 @@ export function Workbench() {
       setNotice(current ? `Lead is locked with ${current}.` : "Claim lead first.");
       return;
     }
-    if (!next) {
-      setNotice("Enter initials to pass the lead.");
+    if (!next || !isSeatInitials(next)) {
+      setNotice("Pass lead to 2 or 3 letter initials.");
       return;
     }
     applyRoster(next, "add");
@@ -405,8 +406,8 @@ export function Workbench() {
   function takeoverLead() {
     const who = normalizeInitials(paths.analyst);
     const current = foldLead(leads);
-    if (!who) {
-      setNotice("Set your initials first.");
+    if (!isSeatInitials(who)) {
+      setNotice("Set 2 or 3 letter initials first.");
       return;
     }
     if (!current) {
@@ -520,15 +521,15 @@ export function Workbench() {
   const me = normalizeInitials(paths.analyst);
 
   function setSeat(raw: string) {
-    const next = { ...paths, analyst: raw.slice(0, 8) };
+    const next = { ...paths, analyst: raw.replace(/[^A-Za-z]/g, "").slice(0, 3) };
     setPaths(next);
     savePaths(next);
   }
 
   function claimSeat() {
     const who = normalizeInitials(paths.analyst);
-    if (!who) {
-      setNotice("Type your initials in the header, then take hosts.");
+    if (!isSeatInitials(who)) {
+      setNotice("Initials are 2 letters, or 3 if someone else already has that pair.");
       return;
     }
     applyRoster(who, "add");
@@ -536,8 +537,8 @@ export function Workbench() {
 
   function takeHost(id: string) {
     const who = normalizeInitials(paths.analyst);
-    if (!who) {
-      setNotice("Set your initials first — top right — then take a host.");
+    if (!isSeatInitials(who)) {
+      setNotice("Set 2 or 3 letter initials first — top right — then take a host.");
       return;
     }
     applyRoster(who, "add");
@@ -575,16 +576,16 @@ export function Workbench() {
         <div className="flex flex-wrap items-end gap-2">
           <div>
             <label htmlFor="seat-initials" className="block text-[0.65rem] uppercase tracking-wider text-subtle">
-              Your initials
+              Your initials (2–3)
             </label>
             <input
               id="seat-initials"
               value={paths.analyst}
               onChange={(e) => setSeat(e.target.value)}
               onBlur={claimSeat}
-              placeholder="AA"
-              maxLength={8}
-              className="mt-1 h-11 w-24 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase text-fg"
+              placeholder="AAM"
+              maxLength={3}
+              className="mt-1 h-11 w-16 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase text-fg"
             />
           </div>
           <div>
@@ -599,15 +600,15 @@ export function Workbench() {
                         id="pass-lead"
                         value={passTo}
                         onChange={(e) => setPassTo(e.target.value)}
-                        placeholder="pass to"
-                        maxLength={8}
-                        className="h-11 w-24 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase text-fg"
+                        placeholder="AAM"
+                        maxLength={3}
+                        className="h-11 w-16 rounded-sm border border-border bg-bg px-3 font-mono text-sm uppercase text-fg"
                       />
                       <Button
                         type="button"
                         size="sm"
                         variant="outline"
-                        disabled={!normalizeInitials(passTo)}
+                        disabled={!isSeatInitials(passTo)}
                         onClick={() => {
                           passLead(passTo);
                           setPassTo("");
@@ -625,7 +626,7 @@ export function Workbench() {
                   )}
                 </>
               ) : (
-                <Button type="button" size="sm" variant="outline" disabled={!me} onClick={claimLead}>
+                <Button type="button" size="sm" variant="outline" disabled={!isSeatInitials(me)} onClick={claimLead}>
                   Claim lead
                 </Button>
               )}
@@ -658,11 +659,11 @@ export function Workbench() {
                     value={witness}
                     onChange={(e) => setWitness(e.target.value)}
                     placeholder="AL"
-                    maxLength={8}
-                    className="mt-1 h-11 w-20 rounded-sm border border-border bg-bg px-2 font-mono text-sm uppercase"
+                    maxLength={3}
+                    className="mt-1 h-11 w-16 rounded-sm border border-border bg-bg px-2 font-mono text-sm uppercase"
                   />
                 </div>
-                <Button type="button" size="sm" onClick={takeoverLead} disabled={!me}>
+                <Button type="button" size="sm" onClick={takeoverLead} disabled={!isSeatInitials(me)}>
                   Take over as {me || "you"}
                 </Button>
               </div>
