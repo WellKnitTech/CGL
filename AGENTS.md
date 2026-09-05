@@ -53,8 +53,8 @@ py -3 ftp_5_0.py --source E:\data_ingest --unzip E:\Results\Extracted --out E:\R
 
 ## Hard rules
 
-1. **Python mill stays stdlib.** No pip. Keep Windows-safe: PID lock via `ctypes` (never `os.kill` on Windows), SQLite URI via `Path.as_uri()`, tar/zip extract sanitizes `..` and illegal path chars.
-2. **Auto-classify.** `plan_stages` / `planStages` pick stages from collection kind. Do not run Hayabusa or RECmd on UAC.
+1. **Windows Velociraptor = v4.9 mill.** `public/ftp_windows.py` is the Forensic Triage Parser 4.9 feature set (7-Zip/zipfile extract, JSON→CSV with workers, RECmd + Kroll SHA256 allow-list, Hayabusa v4 `dfir-timeline` individual+bulk, markers, scheduled task, inventory hashes). `ftp_5_0.py` classifies; `velo_windows` collections are handed to that pipeline. UAC kinds never get Hayabusa/RECmd.
+2. **Python mill: stdlib required.** `tqdm` / `orjson` / `ijson` are optional (`public/requirements.txt`) for faster JSON→CSV. Keep Windows-safe PID lock, SQLite URI, sanitized extract on the 5.0 path.
 3. **Synology:** hidden `.SYNOCONNDB` / `.SYNOSYSDB` (+ WAL) under `var/log/synolog`. Convert sqlite → CSV. Parse `.ash_history` in `/root`.
 4. **Team:** initials only, **2 or 3 letters** (`AA` vs `AAM` when two people share a pair). No IAM. Case lead is locked; only the lead **Pass**es it; **Lead is out** is a logged takeover (PTO/sick/unreachable).
 5. **Lead worklist** shows every host and assignee; analysts see their pile. Anyone can **Take** / assign-to-me.

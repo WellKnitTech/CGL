@@ -39,7 +39,9 @@ powershell -File cgl.ps1 -RegisterTask        # 30-min IgnoreNew sweep
 powershell -File cgl.ps1 -RegisterProtocol    # cgl: links open CSVOutput in Explorer
 ```
 
-Python 3 stdlib only. No pip.
+Python 3.10+. Stdlib is enough. Optional for large Velociraptor JSON: `pip install -r requirements.txt` (`tqdm`, `orjson`, `ijson`).
+
+Windows Velociraptor collections use the **v4.9** mill (`ftp_windows.py`): JSON→CSV, RECmd + Kroll_Batch.reb, Hayabusa v4 dfir-timeline (per-collection as extract finishes, then bulk), `.COMPLETE` markers, chain-of-custody inventory. UAC (Linux/macOS/Synology/ESXi) uses the 5.0 parsers. Hayabusa is never run on UAC.
 
 ## Mill auto-selects stages
 

@@ -1,0 +1,4 @@
+# Optional — speeds Velociraptor JSON→CSV. Mill runs without them (stdlib).
+tqdm
+orjson
+ijson

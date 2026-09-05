@@ -433,22 +433,6 @@ def write_rows(path: Path, rows: list[dict]) -> None:
         w.writerows(rows)
 
 
-def discover(source: Path) -> list[Path]:
-    if not source.exists():
-        return []
-    items = []
-    for p in source.iterdir() if source.is_dir() else [source]:
-        if p.name.startswith("."):
-            continue
-        if p.is_dir():
-            items.append(p)
-            continue
-        suf = "".join(p.suffixes).lower()
-        if suf.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2")):
-            items.append(p)
-    return items
-
-
 CASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS collections (
@@ -470,16 +454,24 @@ def open_case_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def process_one(item: Path, unzip_root: Path, out_root: Path) -> dict:
+def collection_stem(item: Path) -> str:
     name = item.stem if item.is_file() else item.name
     if name.endswith(".tar"):
         name = Path(name).stem
+    return name
+
+
+def process_one(item: Path, unzip_root: Path, out_root: Path) -> dict:
+    name = collection_stem(item)
     extract = unzip_root / name
     if item.is_file():
-        if not extract_archive(item, extract):
-            return {"collection": name, "status": "extract_failed", "host": name, "kind": "unknown", "users": [], "archive": item.name}
+        if not extract.exists():
+            if not extract_archive(item, extract):
+                return {"collection": name, "status": "extract_failed", "host": name, "kind": "unknown", "users": [], "archive": item.name}
     else:
-        extract = item
+        extract = item if not extract.exists() else extract
+        if item.is_dir() and not (unzip_root / name).exists():
+            extract = item
     kind = classify(extract, item.name)
     host = resolve_host(extract, item.name)
     dest = out_root / host
@@ -490,8 +482,15 @@ def process_one(item: Path, unzip_root: Path, out_root: Path) -> dict:
         "source": str(item), "extract": str(extract), "results": str(dest),
         "completed_at": utc_now(), "plan": plan, "users": [], "user_count": 0,
         "conn_rows": 0, "sys_rows": 0, "history_rows": 0, "esxi_hits": 0, "linux_hits": 0,
+        "windows": None,
     }
     extra: list[str] = []
+    if kind == "velo_windows":
+        report["windows"] = "queued"
+        users = collect_users(extract, extra)
+        report["users"] = users
+        report["user_count"] = len(users)
+        return report
     if plan["synology_sqlite"] == "run":
         c, s = dump_synology_csv(extract, dest)
         report["conn_rows"], report["sys_rows"] = c, s
@@ -516,6 +515,75 @@ def process_one(item: Path, unzip_root: Path, out_root: Path) -> dict:
     return report
 
 
+def copy_hayabusa_into_hosts(out_root: Path, summaries: list[dict]) -> None:
+    haya_dir = out_root / "_hayabusa"
+    if not haya_dir.is_dir():
+        return
+    by_stem = {collection_stem(Path(s["source"])): s for s in summaries if s.get("source")}
+    for csv_path in haya_dir.glob("*.csv"):
+        if csv_path.name.lower().startswith("bulk"):
+            continue
+        s = by_stem.get(csv_path.stem)
+        if not s:
+            continue
+        dest = out_root / s["host"] / "hayabusa.csv"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(csv_path, dest)
+        except OSError as e:
+            logging.warning("copy hayabusa %s: %s", csv_path, e)
+
+
+def discover(source: Path) -> list[Path]:
+    if not source.exists():
+        return []
+    items = []
+    seen = set()
+    def add(p: Path):
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(p)
+    roots = [source] if source.is_dir() else [source.parent]
+    for root in roots:
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            current = Path(dirpath)
+            depth = len(current.relative_to(root).parts) if current != root else 0
+            if depth >= 4:
+                dirnames[:] = []
+            if current != root and "collection" in current.name.lower():
+                add(current)
+            for filename in filenames:
+                low = filename.lower()
+                p = current / filename
+                suf = "".join(p.suffixes).lower()
+                if suf.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2")):
+                    add(p)
+    if source.is_file():
+        add(source)
+    elif source.is_dir():
+        for p in source.iterdir():
+            if p.name.startswith("."):
+                continue
+            if p.is_dir():
+                add(p)
+    return items
+
+
+def load_windows():
+    import importlib.util
+    path = Path(__file__).resolve().parent / "ftp_windows.py"
+    spec = importlib.util.spec_from_file_location("ftp_windows", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("ftp_windows.py missing next to ftp_5_0.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=f"CGL {SCRIPT_VERSION} — Collection Grind Ledger")
     p.add_argument("--config", default=None)
@@ -524,9 +592,29 @@ def main() -> int:
     p.add_argument("--out", default=None)
     p.add_argument("--db", default=None)
     p.add_argument("--analyst", default=None)
-    p.add_argument("--non-interactive", "-ni", action="store_true", default=True)
+    p.add_argument("--non-interactive", "-ni", action="store_true")
+    p.add_argument("--setup", action="store_true")
+    p.add_argument("--recmd", action="store_true")
+    p.add_argument("--hayabusa", action="store_true")
+    p.add_argument("--bulk-hayabusa", action="store_true")
+    p.add_argument("--force-reprocess", action="store_true")
+    p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
+    if not args.non_interactive and not args.setup:
+        args.non_interactive = True
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    script_dir = Path(__file__).parent.resolve()
+    config_path = Path(args.config).resolve() if args.config else (script_dir / "ftp50.json")
+    if not config_path.exists():
+        alt = script_dir / "velo_triage_config.json"
+        if alt.exists():
+            config_path = alt
+    cfg = load_mill_config(config_path)
+    if args.setup:
+        win = load_windows()
+        win.run_setup(config_path, script_dir, cfg)
+        return 0
     source, unzip, out, db, analyst = resolve_roots(args)
     logging.info("CGL mill host=%s collections=%s extract=%s results=%s db=%s", os.name, source, unzip, out, db)
     unzip.mkdir(parents=True, exist_ok=True)
@@ -539,6 +627,32 @@ def main() -> int:
         items = discover(source)
         logging.info("unattended: %s collections (auto-select stages)", len(items))
         summaries = [process_one(item, unzip, out) for item in items]
+        velo_items = [Path(s["source"]) for s in summaries if s.get("kind") == "velo_windows" and s.get("source")]
+        windows_report = None
+        if velo_items:
+            win = load_windows()
+            args.source = str(source)
+            args.unzip = str(unzip)
+            args.out = str(out)
+            # load_paths_from_config uses unzip_root from cfg — inject
+            cfg = {
+                **cfg,
+                "source_root": str(source),
+                "unzip_root": str(unzip),
+                "output_root": str(out),
+                "log_root": str(out / "logs"),
+            }
+            windows_report = win.run_velo_windows(velo_items, cfg, config_path, script_dir, args)
+            copy_hayabusa_into_hosts(out, summaries)
+            for s in summaries:
+                if s.get("kind") == "velo_windows":
+                    s["windows"] = "v4.9"
+                    s["plan"]["json_csv"] = "run"
+                    s["plan"]["recmd"] = "run"
+                    s["plan"]["hayabusa"] = "run"
+                    dest = out / s["host"]
+                    dest.mkdir(parents=True, exist_ok=True)
+                    (dest / STAGE_MARKER).write_text(json.dumps(s, indent=2), encoding="utf-8")
         (out / "case_index.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
         fleet: dict[str, dict] = {}
         for s in summaries:
@@ -579,6 +693,7 @@ def main() -> int:
         finally:
             conn.close()
         print(json.dumps({"version": SCRIPT_VERSION, "host_os": os.name, "collections": len(summaries),
+                          "windows": windows_report,
                           "paths": {"source": str(source), "unzip": str(unzip), "out": str(out), "db": str(db)}}, indent=2))
         return 0
     finally:
