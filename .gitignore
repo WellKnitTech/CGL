@@ -7,3 +7,7 @@ node_modules/
 __pycache__/
 *.pyc
 .vercel/
+.DS_Store
+*.case.json
+*.case.db
+dist/

@@ -4,6 +4,8 @@ Unattended mill and workbench for Velociraptor **Windows** collections and **UAC
 
 The mill **runs on Windows lab VMs** (`py -3` / `cgl.cmd`). Collections can be Linux. Hayabusa only runs on Velociraptor Windows drops.
 
+**Coding agents:** read [AGENTS.md](./AGENTS.md) first. Ignore `.grok/` (Grok sandbox metadata, not product code).
+
 ## Paths
 
 | Path | Role |
@@ -12,6 +14,17 @@ The mill **runs on Windows lab VMs** (`py -3` / `cgl.cmd`). Collections can be L
 | Extracted | Raw unpacked tree |
 | CSVOutput | Parsed output analysts review (`E:\Results\CSVOutput\<host>\*.csv`) |
 | Case DB | Shared SQLite + JSON sidecar (worklist, inventory, assignments) |
+
+## Dev (Linux / macOS / Windows)
+
+```bash
+git clone https://github.com/WellKnitTech/CGL.git
+cd CGL
+npm install
+npx tsx --test src/lib/ftp/pipeline.test.ts
+python3 -m py_compile public/ftp_5_0.py
+npm run dev
+```
 
 ## Windows lab
 
@@ -37,8 +50,12 @@ Python 3 stdlib only. No pip.
 
 ## Team
 
-Initials only — no IAM. Case lead is locked until they **Pass** it. **Lead is out** is a logged takeover (PTO / sick / unreachable). Lead sees the full worklist; analysts see their pile. Worklist links open parsed files under CSVOutput.
+Initials only (2 or 3 letters, e.g. `AA` / `AAM`) — no IAM. Case lead is locked until they **Pass** it. **Lead is out** is a logged takeover (PTO / sick / unreachable). Lead sees the full worklist; analysts see their pile. Worklist links open parsed files under CSVOutput.
 
 ## Workbench
 
 React workbench in `src/` (demo collections + live mill command). Engine in `src/lib/ftp/`. Portable mill in `public/ftp_5_0.py`.
+
+## License
+
+MIT. See [LICENSE](./LICENSE).

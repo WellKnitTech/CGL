@@ -1,0 +1,6 @@
+---
+description: CGL mill and workbench
+alwaysApply: true
+---
+
+Follow AGENTS.md at the repo root. This is Collection Grind Ledger (DFIR). Ignore `.grok/`. Mill is `public/ftp_5_0.py`; engine is `src/lib/ftp/`. CSVOutput = parsed; Extracted = raw. Initials are 2 or 3 letters.
