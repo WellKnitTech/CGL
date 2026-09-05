@@ -305,7 +305,8 @@ def find_7zip() -> Path | None:
     for p in candidates:
         if p.exists() and p.is_file():
             return p
-    return None
+    which = shutil.which("7z") or shutil.which("7z.exe")
+    return Path(which) if which else None
 
 def find_recmd() -> Path | None:
     candidates = [
@@ -314,11 +315,14 @@ def find_recmd() -> Path | None:
         Path(r"C:\Program Files\ZimmermanTools\RECmd\RECmd.exe"),
         Path(r"C:\Tools\EZ Tools\RECmd\RECmd.exe"),
         Path(r"C:\tools\EZ Tools\RECmd\RECmd.exe"),
+        Path(r"C:\KAPE\Modules\bin\RECmd\RECmd.exe"),
+        Path(r"C:\Tools\KAPE\Modules\bin\RECmd\RECmd.exe"),
     ]
     for p in candidates:
         if p.exists() and p.is_file():
             return p
-    return None
+    which = shutil.which("RECmd") or shutil.which("RECmd.exe")
+    return Path(which) if which else None
 
 def find_hayabusa_dir() -> Path | None:
     candidates = [
@@ -331,7 +335,8 @@ def find_hayabusa_dir() -> Path | None:
         if d.exists() and d.is_dir():
             if list(d.glob("hayabusa*.exe")):
                 return d
-    return None
+    which = shutil.which("hayabusa") or shutil.which("hayabusa.exe")
+    return Path(which).parent if which else None
 
 def get_hayabusa_version(exe_path: Path) -> str:
     try:
@@ -1143,7 +1148,16 @@ def load_paths_from_config(config: dict) -> dict:
     else:
         hayabusa_dir = find_hayabusa_dir() or Path(r"C:\tools\hayabusa").resolve()
 
-    hayabusa_exe = find_latest_hayabusa(hayabusa_dir)
+    hayabusa_exe = None
+    configured_exe = Path(config["hayabusa_exe"]).resolve() if config.get("hayabusa_exe") else None
+    if configured_exe and configured_exe.is_file():
+        hayabusa_exe = configured_exe
+        hayabusa_dir = configured_exe.parent
+    elif hayabusa_dir.is_file() and hayabusa_dir.name.lower().startswith("hayabusa"):
+        hayabusa_exe = hayabusa_dir
+        hayabusa_dir = hayabusa_exe.parent
+    else:
+        hayabusa_exe = find_latest_hayabusa(hayabusa_dir)
     if hayabusa_exe is None:
         print(f"[WARNING] No Hayabusa executable found in {hayabusa_dir}.")
         hayabusa_exe = Path(config.get("hayabusa_exe", hayabusa_dir / "hayabusa.exe"))

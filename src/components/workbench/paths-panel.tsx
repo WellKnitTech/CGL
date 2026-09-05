@@ -93,6 +93,15 @@ export function PathsPanel({
         <Field id="path-analyst" label="Analyst" hint="2 letters, or 3 if two people share a pair" value={paths.analyst} onChange={(analyst) => onChange({ ...paths, analyst: analyst.replace(/[^A-Za-z]/g, "").slice(0, 3) })} />
       </div>
 
+      <p className="mt-6 text-xs font-medium uppercase tracking-wider text-subtle">Windows tools — leave blank to auto-detect</p>
+      <div className="mt-3 grid gap-4 md:grid-cols-2">
+        <Field id="path-7z" label="7-Zip" hint="7z.exe — zip extract. Blank = Program Files / PATH" value={paths.sevenzipExe ?? ""} onChange={(sevenzipExe) => onChange({ ...paths, sevenzipExe })} />
+        <Field id="path-recmd" label="RECmd" hint="RECmd.exe — registry. Blank = ZimmermanTools / EZ Tools" value={paths.recmdExe ?? ""} onChange={(recmdExe) => onChange({ ...paths, recmdExe })} />
+        <Field id="path-haya" label="Hayabusa folder or exe" hint="Picks latest hayabusa*.exe in the folder" value={paths.hayabusaDir ?? ""} onChange={(hayabusaDir) => onChange({ ...paths, hayabusaDir })} />
+        <Field id="path-haya-out" label="Hayabusa output" hint="Blank = Results\_hayabusa, then copied per host" value={paths.hayabusaOut ?? ""} onChange={(hayabusaOut) => onChange({ ...paths, hayabusaOut })} />
+        <Field id="path-kroll" label="Kroll_Batch.reb" hint="RECmd batch. Blank = KAPE Modules path, then GitHub if allowed" value={paths.krollBatch ?? ""} onChange={(krollBatch) => onChange({ ...paths, krollBatch })} />
+      </div>
+
       {warns.length ? (
         <ul className="mt-3 space-y-1 text-xs text-warn">
           {warns.map((w) => (

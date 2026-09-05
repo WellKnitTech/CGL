@@ -600,6 +600,11 @@ def main() -> int:
     p.add_argument("--force-reprocess", action="store_true")
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--7zip", dest="sevenzip", default=None, help="Path to 7z.exe")
+    p.add_argument("--recmd-exe", dest="recmd_exe", default=None, help="Path to RECmd.exe")
+    p.add_argument("--hayabusa-dir", dest="hayabusa_dir", default=None, help="Hayabusa folder or hayabusa*.exe")
+    p.add_argument("--hayabusa-out", dest="hayabusa_out", default=None, help="Hayabusa output folder")
+    p.add_argument("--kroll", dest="kroll_batch", default=None, help="Path to Kroll_Batch.reb")
     args = p.parse_args()
     if not args.non_interactive and not args.setup:
         args.non_interactive = True
@@ -642,6 +647,16 @@ def main() -> int:
                 "output_root": str(out),
                 "log_root": str(out / "logs"),
             }
+            if getattr(args, "sevenzip", None):
+                cfg["sevenzip_exe"] = args.sevenzip
+            if getattr(args, "recmd_exe", None):
+                cfg["recmd_exe"] = args.recmd_exe
+            if getattr(args, "hayabusa_dir", None):
+                cfg["hayabusa_dir"] = args.hayabusa_dir
+            if getattr(args, "hayabusa_out", None):
+                cfg["hayabusa_out"] = args.hayabusa_out
+            if getattr(args, "kroll_batch", None):
+                cfg["kroll_batch_reb"] = args.kroll_batch
             windows_report = win.run_velo_windows(velo_items, cfg, config_path, script_dir, args)
             copy_hayabusa_into_hosts(out, summaries)
             for s in summaries:

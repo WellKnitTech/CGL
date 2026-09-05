@@ -67,7 +67,7 @@ py -3 ftp_5_0.py --source E:\data_ingest --unzip E:\Results\Extracted --out E:\R
 |---|---|
 | New log family / UAC kind | `src/lib/ftp/classify.ts`, `plan.ts`, `linux-logs.ts`, `public/ftp_5_0.py` |
 | Worklist / lead / initials | `collab.ts`, `workbench.tsx`, `worklist-panel.tsx` |
-| Paths / Explorer links | `paths.ts` (`parsedDiskPath` → CSVOutput) |
+| Paths / Explorer links / tool binaries | `paths.ts` (`parsedDiskPath` → CSVOutput). 7-Zip, RECmd, Hayabusa, Kroll are configurable; blank = auto-detect. |
 | Demo collections | `demo-cases.ts` (keep fictional) |
 | Tests | `src/lib/ftp/pipeline.test.ts` — add a case, don’t delete the mill suite |
 

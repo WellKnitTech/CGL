@@ -85,6 +85,18 @@ describe("ftp 5.0 auto mill", () => {
     assert.match(cmd, /--source E:\\data_ingest/);
     assert.match(cmd, /--analyst AA/);
     assert.equal(pathsConfig(p).case_db, p.dbPath);
+    const withTools = trimPaths({
+      ...p,
+      recmdExe: "C:\\tools\\ZimmermanTools\\net9\\RECmd\\RECmd.exe",
+      hayabusaDir: "C:\\tools\\hayabusa",
+      sevenzipExe: "C:\\Program Files\\7-Zip\\7z.exe",
+      krollBatch: "C:\\Tools\\KAPE\\Modules\\bin\\RECmd\\BatchExamples\\Kroll_Batch.reb",
+    });
+    const cfg = pathsConfig(withTools);
+    assert.equal(cfg.recmd_exe, withTools.recmdExe);
+    assert.match(millCommand(withTools), /--recmd-exe /);
+    assert.match(millCommand(withTools), /--7zip /);
+    assert.equal(pathsConfig(p).recmd_exe, undefined);
     assert.equal(
       parsedDiskPath(p.outputRoot, "app-01", "linux_ir_signals.csv"),
       "E:\\Results\\CSVOutput\\app-01\\linux_ir_signals.csv",
